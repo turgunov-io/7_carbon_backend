@@ -249,6 +249,26 @@ CREATE TABLE IF NOT EXISTS public.about_development_milestones (
     position INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS public.about_metrics (
+    id SERIAL PRIMARY KEY,
+    about_id SMALLINT NOT NULL DEFAULT 1 REFERENCES public.about_page(id) ON DELETE CASCADE,
+    metric_key TEXT NOT NULL,
+    metric_value TEXT NOT NULL,
+    metric_label TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (about_id, metric_key)
+);
+
+CREATE TABLE IF NOT EXISTS public.about_sections (
+    id SERIAL PRIMARY KEY,
+    about_id SMALLINT NOT NULL DEFAULT 1 REFERENCES public.about_page(id) ON DELETE CASCADE,
+    section_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (about_id, section_key)
+);
+
 -- 10. Contact page
 CREATE TABLE IF NOT EXISTS public.contact_page (
     id SMALLINT PRIMARY KEY DEFAULT 1,
@@ -402,6 +422,12 @@ CREATE INDEX IF NOT EXISTS idx_tuning_created_at_id
 CREATE INDEX IF NOT EXISTS idx_service_offerings_type_position
     ON public.service_offerings (service_type, position, id);
 
+CREATE INDEX IF NOT EXISTS idx_about_metrics_about_position
+    ON public.about_metrics (about_id, position, id);
+
+CREATE INDEX IF NOT EXISTS idx_about_sections_about_position
+    ON public.about_sections (about_id, position, id);
+
 CREATE INDEX IF NOT EXISTS idx_consultations_created_at_id
     ON public.consultations (created_at DESC, id DESC);
 
@@ -445,9 +471,76 @@ SELECT
     'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
 WHERE NOT EXISTS (SELECT 1 FROM public.work_post);
 
+-- Seed data for /about.
+INSERT INTO public.about_page (
+    id,
+    banner_title,
+    history_description,
+    mission_description
+)
+SELECT
+    1,
+    'О КОМПАНИИ',
+    'В 7 Carbon мы идем дальше, предлагая нашим клиентам нечто более чем стандартные решения. Мы разрабатываем и изготавливаем детали из углеволокна под заказ, чтобы ваш автомобиль стал уникальным произведением искусства.',
+    'Наша команда дизайнеров и инженеров работает с вами, чтобы воплотить в жизнь вашу уникальную визию и создать автомобиль, который подчеркнет ваш стиль и индивидуальность.'
+WHERE NOT EXISTS (SELECT 1 FROM public.about_page WHERE id = 1);
+
+INSERT INTO public.about_metrics (about_id, metric_key, metric_value, metric_label, position)
+SELECT
+    1,
+    src.metric_key,
+    src.metric_value,
+    src.metric_label,
+    src.position
+FROM (
+    VALUES
+        ('client_projects', '20+', 'Клиентских проектов', 1),
+        ('manufactured_parts', '7500+', 'Изготовленных деталей', 2),
+        ('key_partners', '11', 'Крупных партнёров', 3)
+) AS src(metric_key, metric_value, metric_label, position)
+WHERE NOT EXISTS (SELECT 1 FROM public.about_metrics WHERE about_id = 1);
+
+INSERT INTO public.about_sections (about_id, section_key, title, description, position)
+SELECT
+    1,
+    src.section_key,
+    src.title,
+    src.description,
+    src.position
+FROM (
+    VALUES
+        (
+            'history',
+            'КРАТКАЯ ИСТОРИЯ 7 CARBON',
+            'Зарождение 7 Carbon в 2020 году было исключительно страстью к автомобилям, выросшей в профессиональное тюнинг ателье. С момента своего создания мы стремились преобразовывать автомобили в уникальные произведения искусства с инновационным дизайном. Начав с небольших гаражей, мы выросли в узнаваемый бренд, поистине цененный в мире автотюнинга.
+
+7 Carbon стало не просто именем, а философией, где техническое мастерство сочетается с творческим вдохновением. Каждый наш проект - это уникальное творение, отражающее индивидуальность и стиль. Сегодня 7 Carbon - это история страсти и инноваций, оставляющая свой неповторимый след в автомобильной индустрии.',
+            1
+        ),
+        (
+            'philosophy',
+            'ФИЛОСОФИЯ',
+            'Принципы, которыми руководствуется 7 Carbon, определяют наше место в мире тюнинга. Наш подход основан на тщательном балансе между техническим мастерством и творчеством. Мы стремимся к совершенству в каждом проекте, выделяясь инновационными решениями и качественной реализацией.
+
+Наша команда избегает шаблонов, придерживаясь философии индивидуализации. Мы уважаем искусство автомобильного дизайна, поэтому каждый проект - это уникальная история, рассказанная через детали и формы. Технологический прогресс и инновации - в основе нашей работы.',
+            2
+        ),
+        (
+            'certification',
+            'СЕРТИФИКАЦИЯ',
+            'В 7 Carbon мы придаем первостепенное значение качеству, сертификации и профессионализму. Каждый материал, использованный в наших проектах, проходит строгий отбор и сертификацию, гарантируя высший стандарт. Наша команда специалистов также подвергается сертификации, обеспечивая мастерство и навыки на высочайшем уровне.
+
+Мы сотрудничаем только с проверенными поставщиками, чтобы предоставлять клиентам материалы выдающегося качества. Этот подход обеспечивает долговечность и надежность каждого элемента, воплощенного в наших творениях.',
+            3
+        )
+) AS src(section_key, title, description, position)
+WHERE NOT EXISTS (SELECT 1 FROM public.about_sections WHERE about_id = 1);
+
 COMMIT;
 
 -- Optional checks after execution:
 -- SELECT COUNT(*) FROM public.banners;
 -- SELECT COUNT(*) FROM public.portfolio_items;
 -- SELECT COUNT(*) FROM public.work_post;
+-- SELECT COUNT(*) FROM public.about_metrics;
+-- SELECT COUNT(*) FROM public.about_sections;

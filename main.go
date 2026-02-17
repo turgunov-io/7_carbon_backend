@@ -52,6 +52,7 @@ func main() {
 	mux.HandleFunc("/", app.rootHandler)
 	mux.HandleFunc("/healthz", app.healthHandler)
 	mux.HandleFunc("/contact", app.contactHandler)
+	mux.HandleFunc("/about", app.aboutHandler)
 	mux.HandleFunc("/banners", app.bannersHandler)
 	mux.HandleFunc("/partners", app.partnersHandler)
 	mux.HandleFunc("/tuning", app.tuningHandler)
@@ -232,6 +233,172 @@ func (a *App) contactHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to encode response", http.StatusInternalServerError)
 		return
 	}
+}
+
+func (a *App) aboutHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	type aboutPage struct {
+		ID                 int     `json:"id"`
+		Title              *string `json:"title"`
+		BannerImageURL     *string `json:"banner_image_url"`
+		IntroDescription   *string `json:"intro_description"`
+		MissionDescription *string `json:"mission_description"`
+		VideoURL           *string `json:"video_url"`
+		MissionImageURL    *string `json:"mission_image_url"`
+	}
+	type aboutMetric struct {
+		ID       int    `json:"id"`
+		Key      string `json:"key"`
+		Value    string `json:"value"`
+		Label    string `json:"label"`
+		Position int    `json:"position"`
+	}
+	type aboutSection struct {
+		ID          int    `json:"id"`
+		Key         string `json:"key"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Position    int    `json:"position"`
+	}
+	type aboutResponse struct {
+		Page     *aboutPage     `json:"page"`
+		Metrics  []aboutMetric  `json:"metrics"`
+		Sections []aboutSection `json:"sections"`
+	}
+
+	page := (*aboutPage)(nil)
+	metrics := make([]aboutMetric, 0, 4)
+	sections := make([]aboutSection, 0, 4)
+
+	hasAboutPage, err := hasTable(ctx, a.DB, "about_page")
+	if err != nil {
+		http.Error(w, "failed to resolve about page table", http.StatusInternalServerError)
+		return
+	}
+	if hasAboutPage {
+		var pageItem aboutPage
+		var title sql.NullString
+		var bannerImageURL sql.NullString
+		var introDescription sql.NullString
+		var missionDescription sql.NullString
+		var videoURL sql.NullString
+		var missionImageURL sql.NullString
+
+		err := a.DB.QueryRowContext(
+			ctx,
+			`SELECT id, banner_title, banner_image_url, history_description, mission_description, video_url, mission_image_url
+			FROM public.about_page
+			ORDER BY id ASC
+			LIMIT 1`,
+		).Scan(
+			&pageItem.ID,
+			&title,
+			&bannerImageURL,
+			&introDescription,
+			&missionDescription,
+			&videoURL,
+			&missionImageURL,
+		)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "failed to fetch about page", http.StatusInternalServerError)
+			return
+		}
+		if err == nil {
+			pageItem.Title = nullableString(title)
+			pageItem.BannerImageURL = nullableString(bannerImageURL)
+			pageItem.IntroDescription = nullableString(introDescription)
+			pageItem.MissionDescription = nullableString(missionDescription)
+			pageItem.VideoURL = nullableString(videoURL)
+			pageItem.MissionImageURL = nullableString(missionImageURL)
+			page = &pageItem
+		}
+	}
+
+	aboutID := 1
+	if page != nil {
+		aboutID = page.ID
+	}
+
+	hasAboutMetrics, err := hasTable(ctx, a.DB, "about_metrics")
+	if err != nil {
+		http.Error(w, "failed to resolve about metrics table", http.StatusInternalServerError)
+		return
+	}
+	if hasAboutMetrics {
+		rows, err := a.DB.QueryContext(
+			ctx,
+			`SELECT id, metric_key, metric_value, metric_label, position
+			FROM public.about_metrics
+			WHERE about_id = $1
+			ORDER BY position ASC, id ASC`,
+			aboutID,
+		)
+		if err != nil {
+			http.Error(w, "failed to fetch about metrics", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var item aboutMetric
+			if err := rows.Scan(&item.ID, &item.Key, &item.Value, &item.Label, &item.Position); err != nil {
+				http.Error(w, "failed to read about metrics", http.StatusInternalServerError)
+				return
+			}
+			metrics = append(metrics, item)
+		}
+		if err := rows.Err(); err != nil {
+			http.Error(w, "failed to read about metrics", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	hasAboutSections, err := hasTable(ctx, a.DB, "about_sections")
+	if err != nil {
+		http.Error(w, "failed to resolve about sections table", http.StatusInternalServerError)
+		return
+	}
+	if hasAboutSections {
+		rows, err := a.DB.QueryContext(
+			ctx,
+			`SELECT id, section_key, title, description, position
+			FROM public.about_sections
+			WHERE about_id = $1
+			ORDER BY position ASC, id ASC`,
+			aboutID,
+		)
+		if err != nil {
+			http.Error(w, "failed to fetch about sections", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var item aboutSection
+			if err := rows.Scan(&item.ID, &item.Key, &item.Title, &item.Description, &item.Position); err != nil {
+				http.Error(w, "failed to read about sections", http.StatusInternalServerError)
+				return
+			}
+			sections = append(sections, item)
+		}
+		if err := rows.Err(); err != nil {
+			http.Error(w, "failed to read about sections", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, aboutResponse{
+		Page:     page,
+		Metrics:  metrics,
+		Sections: sections,
+	})
 }
 
 func (a *App) partnersHandler(w http.ResponseWriter, r *http.Request) {
@@ -957,7 +1124,7 @@ func (a *App) rootHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/banners","/partners","/tuning","/service_offerings","/privacy_sections","/api/consultations","/portfolio_items","/work_post"]}`))
+	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/about","/banners","/partners","/tuning","/service_offerings","/privacy_sections","/api/consultations","/portfolio_items","/work_post"]}`))
 }
 
 func openDB(dsn string) (*sql.DB, error) {
@@ -1278,6 +1445,24 @@ func hasColumn(ctx context.Context, db *sql.DB, tableName, columnName string) (b
 		)`,
 		tableName,
 		columnName,
+	).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+func hasTable(ctx context.Context, db *sql.DB, tableName string) (bool, error) {
+	var exists bool
+	err := db.QueryRowContext(
+		ctx,
+		`SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = 'public'
+			  AND table_name = $1
+		)`,
+		tableName,
 	).Scan(&exists)
 	if err != nil {
 		return false, err
