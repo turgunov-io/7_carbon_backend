@@ -1,6 +1,17 @@
 -- carbon_go bootstrap schema
 -- Run this file once in a clean DB (or repeatedly; all CREATE statements are idempotent).
--- Active API routes in main.go: /banners, /portfolio_items, /work_post
+-- Active API routes in main.go:
+-- /healthz
+-- /contact
+-- /about
+-- /banners
+-- /partners
+-- /tuning
+-- /service_offerings
+-- /privacy_sections
+-- /api/consultations
+-- /portfolio_items
+-- /work_post
 
 BEGIN;
 
@@ -539,8 +550,28 @@ WHERE NOT EXISTS (SELECT 1 FROM public.about_sections WHERE about_id = 1);
 COMMIT;
 
 -- Optional checks after execution:
+-- SELECT COUNT(*) FROM public.contact;
+-- SELECT COUNT(*) FROM public.about_page;
 -- SELECT COUNT(*) FROM public.banners;
+-- SELECT COUNT(*) FROM public.partners;
+-- SELECT COUNT(*) FROM public.tuning;
+-- SELECT COUNT(*) FROM public.service_offerings;
+-- SELECT COUNT(*) FROM public.privacy_sections;
+-- SELECT COUNT(*) FROM public.consultations;
 -- SELECT COUNT(*) FROM public.portfolio_items;
 -- SELECT COUNT(*) FROM public.work_post;
 -- SELECT COUNT(*) FROM public.about_metrics;
 -- SELECT COUNT(*) FROM public.about_sections;
+
+
+
+-- Файл: schema.sql (line 1)
+
+-- Запуск для новой БД:
+
+-- psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema.sql
+-- Быстрая проверка после запуска:
+
+-- SELECT COUNT(*) FROM public.about_page;
+-- SELECT COUNT(*) FROM public.about_metrics;
+-- SELECT COUNT(*) FROM public.about_secti
