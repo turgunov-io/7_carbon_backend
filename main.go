@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +24,8 @@ import (
 type App struct {
 	DB *sql.DB
 }
+
+var phonePattern = regexp.MustCompile(`^\+?[0-9]{7,15}$`)
 
 func main() {
 	if err := loadDotEnv(); err != nil {
@@ -51,6 +56,7 @@ func main() {
 	mux.HandleFunc("/partners", app.partnersHandler)
 	mux.HandleFunc("/tuning", app.tuningHandler)
 	mux.HandleFunc("/service_offerings", app.serviceOfferingsHandler)
+	mux.HandleFunc("/api/consultations", app.consultationsHandler)
 	mux.HandleFunc("/portfolio_items", app.portfolioItemsHandler)
 	mux.HandleFunc("/work_post", app.workPostHandler)
 
@@ -683,6 +689,217 @@ func (a *App) serviceOfferingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *App) consultationsHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		a.createConsultationHandler(w, r)
+	case http.MethodGet:
+		a.listConsultationsHandler(w, r)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+			"status":  "error",
+			"message": "Метод не поддерживается",
+		})
+	}
+}
+
+func (a *App) createConsultationHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB safety limit for JSON payload
+	defer r.Body.Close()
+
+	type consultationCreateRequest struct {
+		FirstName         string `json:"first_name"`
+		LastName          string `json:"last_name"`
+		Phone             string `json:"phone"`
+		ServiceType       string `json:"service_type"`
+		CarModel          string `json:"car_model"`
+		PreferredCallTime string `json:"preferred_call_time"`
+		Comments          string `json:"comments"`
+	}
+
+	var req consultationCreateRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "Некорректный JSON",
+			"errors": map[string]string{
+				"body": "Проверьте формат запроса",
+			},
+		})
+		return
+	}
+
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "Некорректный JSON",
+			"errors": map[string]string{
+				"body": "Ожидается один JSON-объект",
+			},
+		})
+		return
+	}
+
+	errorsMap := validateConsultationRequest(
+		req.FirstName,
+		req.LastName,
+		req.Phone,
+		req.ServiceType,
+		req.CarModel,
+		req.PreferredCallTime,
+		req.Comments,
+	)
+	if len(errorsMap) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"status":  "error",
+			"message": "Ошибка валидации",
+			"errors":  errorsMap,
+		})
+		return
+	}
+
+	firstName := strings.TrimSpace(req.FirstName)
+	lastName := strings.TrimSpace(req.LastName)
+	phone := strings.TrimSpace(req.Phone)
+	serviceType := strings.TrimSpace(req.ServiceType)
+	carModel := optionalStringDBValue(req.CarModel)
+	preferredCallTime := optionalStringDBValue(req.PreferredCallTime)
+	comments := optionalStringDBValue(req.Comments)
+
+	var id int64
+	var createdAt time.Time
+	err := a.DB.QueryRowContext(
+		ctx,
+		`INSERT INTO public.consultations
+		(first_name, last_name, phone, service_type, car_model, preferred_call_time, comments, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'new')
+		RETURNING id, created_at`,
+		firstName,
+		lastName,
+		phone,
+		serviceType,
+		carModel,
+		preferredCallTime,
+		comments,
+	).Scan(&id, &createdAt)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "Не удалось сохранить заявку",
+		})
+		return
+	}
+
+	go notifyAdminAboutConsultation(consultationNotification{
+		ID:                id,
+		FirstName:         firstName,
+		LastName:          lastName,
+		Phone:             phone,
+		ServiceType:       serviceType,
+		CarModel:          optionalStringValue(req.CarModel),
+		PreferredCallTime: optionalStringValue(req.PreferredCallTime),
+		Comments:          optionalStringValue(req.Comments),
+		Status:            "new",
+		CreatedAt:         createdAt,
+	})
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"status":  "success",
+		"message": "Заявка успешно создана",
+		"data": map[string]any{
+			"id":         id,
+			"created_at": createdAt.UTC().Format(time.RFC3339),
+		},
+	})
+}
+
+func (a *App) listConsultationsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	statusFilter := strings.TrimSpace(r.URL.Query().Get("status"))
+	query := `SELECT id, first_name, last_name, phone, service_type, car_model, preferred_call_time, comments, status, created_at
+		FROM public.consultations`
+	args := []any{}
+	if statusFilter != "" {
+		query += ` WHERE status = $1`
+		args = append(args, statusFilter)
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+
+	rows, err := a.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "Не удалось получить заявки",
+		})
+		return
+	}
+	defer rows.Close()
+
+	type consultationItem struct {
+		ID                int64     `json:"id"`
+		FirstName         string    `json:"first_name"`
+		LastName          string    `json:"last_name"`
+		Phone             string    `json:"phone"`
+		ServiceType       string    `json:"service_type"`
+		CarModel          *string   `json:"car_model"`
+		PreferredCallTime *string   `json:"preferred_call_time"`
+		Comments          *string   `json:"comments"`
+		Status            string    `json:"status"`
+		CreatedAt         time.Time `json:"created_at"`
+	}
+
+	items := make([]consultationItem, 0, 16)
+	for rows.Next() {
+		var item consultationItem
+		var carModel sql.NullString
+		var preferredCallTime sql.NullString
+		var comments sql.NullString
+
+		if err := rows.Scan(
+			&item.ID,
+			&item.FirstName,
+			&item.LastName,
+			&item.Phone,
+			&item.ServiceType,
+			&carModel,
+			&preferredCallTime,
+			&comments,
+			&item.Status,
+			&item.CreatedAt,
+		); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"status":  "error",
+				"message": "Не удалось прочитать заявки",
+			})
+			return
+		}
+
+		item.CarModel = nullableString(carModel)
+		item.PreferredCallTime = nullableString(preferredCallTime)
+		item.Comments = nullableString(comments)
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "Не удалось прочитать заявки",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"data":   items,
+	})
+}
+
 // rootHandler gives a friendly response for "/" instead of 404.
 func (a *App) rootHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
@@ -690,7 +907,7 @@ func (a *App) rootHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/banners","/partners","/tuning","/service_offerings","/portfolio_items","/work_post"]}`))
+	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/banners","/partners","/tuning","/service_offerings","/api/consultations","/portfolio_items","/work_post"]}`))
 }
 
 func openDB(dsn string) (*sql.DB, error) {
@@ -835,6 +1052,125 @@ func parseStringArray(raw []byte) []string {
 	}
 
 	return []string{}
+}
+
+func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+	}
+}
+
+func optionalStringDBValue(input string) any {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return nil
+	}
+	return trimmed
+}
+
+func optionalStringValue(input string) *string {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
+}
+
+func validateConsultationRequest(firstName, lastName, phone, serviceType, carModel, preferredCallTime, comments string) map[string]string {
+	errs := map[string]string{}
+
+	firstName = strings.TrimSpace(firstName)
+	lastName = strings.TrimSpace(lastName)
+	phone = strings.TrimSpace(phone)
+	serviceType = strings.TrimSpace(serviceType)
+	carModel = strings.TrimSpace(carModel)
+	preferredCallTime = strings.TrimSpace(preferredCallTime)
+	comments = strings.TrimSpace(comments)
+
+	if firstName == "" {
+		errs["first_name"] = "Поле обязательно"
+	} else if len([]rune(firstName)) > 100 {
+		errs["first_name"] = "Максимум 100 символов"
+	}
+
+	if lastName == "" {
+		errs["last_name"] = "Поле обязательно"
+	} else if len([]rune(lastName)) > 100 {
+		errs["last_name"] = "Максимум 100 символов"
+	}
+
+	if phone == "" {
+		errs["phone"] = "Поле обязательно"
+	} else if !phonePattern.MatchString(phone) {
+		errs["phone"] = "Некорректный формат номера"
+	}
+
+	if serviceType == "" {
+		errs["service_type"] = "Поле обязательно"
+	} else if len([]rune(serviceType)) > 80 {
+		errs["service_type"] = "Максимум 80 символов"
+	}
+
+	if len([]rune(carModel)) > 120 {
+		errs["car_model"] = "Максимум 120 символов"
+	}
+	if len([]rune(preferredCallTime)) > 120 {
+		errs["preferred_call_time"] = "Максимум 120 символов"
+	}
+	if len([]rune(comments)) > 2000 {
+		errs["comments"] = "Максимум 2000 символов"
+	}
+
+	return errs
+}
+
+type consultationNotification struct {
+	ID                int64     `json:"id"`
+	FirstName         string    `json:"first_name"`
+	LastName          string    `json:"last_name"`
+	Phone             string    `json:"phone"`
+	ServiceType       string    `json:"service_type"`
+	CarModel          *string   `json:"car_model"`
+	PreferredCallTime *string   `json:"preferred_call_time"`
+	Comments          *string   `json:"comments"`
+	Status            string    `json:"status"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+func notifyAdminAboutConsultation(payload consultationNotification) {
+	webhookURL := strings.TrimSpace(os.Getenv("ADMIN_NOTIFY_WEBHOOK_URL"))
+	if webhookURL == "" {
+		return
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("consultation notify marshal error: %v", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("consultation notify request error: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		log.Printf("consultation notify send error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("consultation notify non-2xx status: %s", resp.Status)
+	}
 }
 
 func resolveWorkPostTable(ctx context.Context, db *sql.DB) (string, error) {

@@ -281,6 +281,21 @@ CREATE TABLE IF NOT EXISTS public.consultation_leads (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 11.1 Mobile app consultations
+CREATE TABLE IF NOT EXISTS public.consultations (
+    id BIGSERIAL PRIMARY KEY,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    service_type TEXT NOT NULL,
+    car_model TEXT,
+    preferred_call_time TEXT,
+    comments TEXT,
+    status TEXT NOT NULL DEFAULT 'new'
+        CHECK (status IN ('new', 'in_progress', 'completed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- 12. Privacy policy
 CREATE TABLE IF NOT EXISTS public.privacy_sections (
     id SERIAL PRIMARY KEY,
@@ -386,6 +401,12 @@ CREATE INDEX IF NOT EXISTS idx_tuning_created_at_id
 
 CREATE INDEX IF NOT EXISTS idx_service_offerings_type_position
     ON public.service_offerings (service_type, position, id);
+
+CREATE INDEX IF NOT EXISTS idx_consultations_created_at_id
+    ON public.consultations (created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_consultations_status_created_at
+    ON public.consultations (status, created_at DESC, id DESC);
 
 -- Seed data for active routes (insert only when table is empty).
 INSERT INTO public.banners (section, title, image_url, priority)
