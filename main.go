@@ -56,6 +56,7 @@ func main() {
 	mux.HandleFunc("/partners", app.partnersHandler)
 	mux.HandleFunc("/tuning", app.tuningHandler)
 	mux.HandleFunc("/service_offerings", app.serviceOfferingsHandler)
+	mux.HandleFunc("/privacy_sections", app.privacySectionsHandler)
 	mux.HandleFunc("/api/consultations", app.consultationsHandler)
 	mux.HandleFunc("/portfolio_items", app.portfolioItemsHandler)
 	mux.HandleFunc("/work_post", app.workPostHandler)
@@ -689,6 +690,55 @@ func (a *App) serviceOfferingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *App) privacySectionsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	rows, err := a.DB.QueryContext(
+		ctx,
+		`SELECT id, title, description, position
+		FROM public.privacy_sections
+		ORDER BY position ASC, id ASC`,
+	)
+	if err != nil {
+		http.Error(w, "failed to fetch privacy sections", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type privacySection struct {
+		ID          int    `json:"id"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Position    int    `json:"position"`
+	}
+
+	items := make([]privacySection, 0, 8)
+	for rows.Next() {
+		var item privacySection
+		if err := rows.Scan(&item.ID, &item.Title, &item.Description, &item.Position); err != nil {
+			http.Error(w, "failed to read privacy sections", http.StatusInternalServerError)
+			return
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, "failed to read privacy sections", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(items); err != nil {
+		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+		return
+	}
+}
+
 func (a *App) consultationsHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
@@ -907,7 +957,7 @@ func (a *App) rootHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/banners","/partners","/tuning","/service_offerings","/api/consultations","/portfolio_items","/work_post"]}`))
+	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/banners","/partners","/tuning","/service_offerings","/privacy_sections","/api/consultations","/portfolio_items","/work_post"]}`))
 }
 
 func openDB(dsn string) (*sql.DB, error) {
