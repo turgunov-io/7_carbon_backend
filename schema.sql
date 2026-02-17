@@ -50,6 +50,21 @@ CREATE TABLE IF NOT EXISTS public.services (
     position INTEGER NOT NULL DEFAULT 0
 );
 
+-- 3.1 Service cards/details (type -> title -> detailed page content)
+CREATE TABLE IF NOT EXISTS public.service_offerings (
+    id SERIAL PRIMARY KEY,
+    service_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detailed_description TEXT,
+    gallery_images JSONB NOT NULL DEFAULT '[]'::jsonb,
+    price_text TEXT,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT service_offerings_gallery_images_is_array_chk
+        CHECK (jsonb_typeof(gallery_images) = 'array')
+);
+
 -- 4. Why us
 CREATE TABLE IF NOT EXISTS public.why_uct (
     id SMALLINT PRIMARY KEY DEFAULT 1,
@@ -135,6 +150,84 @@ CREATE TABLE IF NOT EXISTS public.tuning_measurement_charts (
     description TEXT,
     image_url TEXT
 );
+
+-- 8.1 Tuning posts/cards
+CREATE TABLE IF NOT EXISTS public.tuning (
+    id SERIAL PRIMARY KEY,
+    brand TEXT,
+    model TEXT,
+    card_image_url TEXT,
+    full_image_url JSONB NOT NULL DEFAULT '[]'::jsonb,
+    price TEXT,
+    description TEXT,
+    card_description TEXT,
+    full_description TEXT,
+    video_image_url TEXT,
+    video_link TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Ensure compatibility for already existing databases.
+-- This block safely creates/converts full_image_url to JSONB array.
+DO $$
+DECLARE col_type TEXT;
+BEGIN
+    IF to_regclass('public.tuning') IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT data_type
+      INTO col_type
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'tuning'
+       AND column_name = 'full_image_url';
+
+    IF col_type IS NULL THEN
+        ALTER TABLE public.tuning
+            ADD COLUMN full_image_url JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ELSIF col_type <> 'jsonb' THEN
+        ALTER TABLE public.tuning
+            ALTER COLUMN full_image_url TYPE JSONB
+            USING CASE
+                WHEN full_image_url IS NULL OR btrim(full_image_url::text) = '' THEN '[]'::jsonb
+                WHEN left(btrim(full_image_url::text), 1) = '[' THEN full_image_url::jsonb
+                ELSE jsonb_build_array(full_image_url)
+            END;
+        ALTER TABLE public.tuning
+            ALTER COLUMN full_image_url SET DEFAULT '[]'::jsonb;
+        UPDATE public.tuning
+           SET full_image_url = '[]'::jsonb
+         WHERE full_image_url IS NULL;
+        ALTER TABLE public.tuning
+            ALTER COLUMN full_image_url SET NOT NULL;
+    ELSE
+        ALTER TABLE public.tuning
+            ALTER COLUMN full_image_url SET DEFAULT '[]'::jsonb;
+        UPDATE public.tuning
+           SET full_image_url = '[]'::jsonb
+         WHERE full_image_url IS NULL;
+        ALTER TABLE public.tuning
+            ALTER COLUMN full_image_url SET NOT NULL;
+    END IF;
+
+    ALTER TABLE public.tuning
+        DROP CONSTRAINT IF EXISTS tuning_full_image_url_is_array_chk;
+
+    ALTER TABLE public.tuning
+        ADD CONSTRAINT tuning_full_image_url_is_array_chk
+        CHECK (jsonb_typeof(full_image_url) = 'array');
+END $$;
+
+ALTER TABLE IF EXISTS public.tuning
+    ADD COLUMN IF NOT EXISTS price TEXT;
+
+ALTER TABLE IF EXISTS public.tuning
+    ADD COLUMN IF NOT EXISTS brand TEXT;
+
+ALTER TABLE IF EXISTS public.tuning
+    ADD COLUMN IF NOT EXISTS model TEXT;
 
 -- 9. About page
 CREATE TABLE IF NOT EXISTS public.about_page (
@@ -287,6 +380,12 @@ CREATE INDEX IF NOT EXISTS idx_work_post_created_at_id
 
 CREATE INDEX IF NOT EXISTS idx_blog_posts_created_at_id
     ON public.blog_posts (created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tuning_created_at_id
+    ON public.tuning (created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_service_offerings_type_position
+    ON public.service_offerings (service_type, position, id);
 
 -- Seed data for active routes (insert only when table is empty).
 INSERT INTO public.banners (section, title, image_url, priority)

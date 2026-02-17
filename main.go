@@ -49,6 +49,8 @@ func main() {
 	mux.HandleFunc("/contact", app.contactHandler)
 	mux.HandleFunc("/banners", app.bannersHandler)
 	mux.HandleFunc("/partners", app.partnersHandler)
+	mux.HandleFunc("/tuning", app.tuningHandler)
+	mux.HandleFunc("/service_offerings", app.serviceOfferingsHandler)
 	mux.HandleFunc("/portfolio_items", app.portfolioItemsHandler)
 	mux.HandleFunc("/work_post", app.workPostHandler)
 
@@ -270,6 +272,132 @@ func (a *App) partnersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *App) tuningHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	queries := []string{
+		`SELECT id, to_jsonb(t)->>'brand' AS brand, to_jsonb(t)->>'model' AS model, NULL::text AS title, card_image_url, full_image_url, description, card_description, full_description, video_image_url, video_link, to_jsonb(t)->>'price' AS price, created_at, updated_at
+		FROM public.tuning t
+		ORDER BY created_at DESC, id DESC`,
+		`SELECT id, to_jsonb(t)->>'brand' AS brand, to_jsonb(t)->>'model' AS model, title, card_image_url, full_image_url, title AS description, card_description, full_description, video_image_url, video_link, to_jsonb(t)->>'price' AS price, created_at, updated_at
+		FROM public.tuning t
+		ORDER BY created_at DESC, id DESC`,
+		`SELECT id, to_jsonb(t)->>'brand' AS brand, to_jsonb(t)->>'model' AS model, NULL::text AS title, card_image_url, NULL::jsonb AS full_image_url, description, card_description, full_description, video_image_url, video_link, to_jsonb(t)->>'price' AS price, created_at, updated_at
+		FROM public.tuning t
+		ORDER BY created_at DESC, id DESC`,
+		`SELECT id, to_jsonb(t)->>'brand' AS brand, to_jsonb(t)->>'model' AS model, title, card_image_url, NULL::jsonb AS full_image_url, title AS description, card_description, full_description, video_image_url, video_link, to_jsonb(t)->>'price' AS price, created_at, updated_at
+		FROM public.tuning t
+		ORDER BY created_at DESC, id DESC`,
+		`SELECT row_number() OVER () AS id, to_jsonb(t)->>'brand' AS brand, to_jsonb(t)->>'model' AS model, NULL::text AS title, card_image_url, NULL::jsonb AS full_image_url, description, card_description, full_description, video_image_url, video_link, to_jsonb(t)->>'price' AS price, NOW() AS created_at, NOW() AS updated_at
+		FROM public.tuning t`,
+		`SELECT row_number() OVER () AS id, to_jsonb(t)->>'brand' AS brand, to_jsonb(t)->>'model' AS model, title, card_image_url, NULL::jsonb AS full_image_url, title AS description, card_description, full_description, video_image_url, video_link, to_jsonb(t)->>'price' AS price, NOW() AS created_at, NOW() AS updated_at
+		FROM public.tuning t`,
+		`SELECT id, to_jsonb(t)->>'brand' AS brand, to_jsonb(t)->>'model' AS model, NULL::text AS title, card_image_url, full_image_url, description, card_description, full_description, video_image_url, video_link, to_jsonb(t)->>'price' AS price, created_at, updated_at
+		FROM public.tunning t
+		ORDER BY created_at DESC, id DESC`,
+		`SELECT id, to_jsonb(t)->>'brand' AS brand, to_jsonb(t)->>'model' AS model, title, card_image_url, full_image_url, title AS description, card_description, full_description, video_image_url, video_link, to_jsonb(t)->>'price' AS price, created_at, updated_at
+		FROM public.tunning t
+		ORDER BY created_at DESC, id DESC`,
+	}
+
+	var rows *sql.Rows
+	var err error
+	for _, query := range queries {
+		rows, err = a.DB.QueryContext(ctx, query)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		http.Error(w, "failed to fetch tuning", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type tuningItem struct {
+		ID              int       `json:"id"`
+		Brand           *string   `json:"brand"`
+		Model           *string   `json:"model"`
+		Title           *string   `json:"title"`
+		CardImageURL    *string   `json:"card_image_url"`
+		FullImageURL    []string  `json:"full_image_url"`
+		Price           *string   `json:"price"`
+		Description     *string   `json:"description"`
+		CardDescription *string   `json:"card_description"`
+		FullDescription *string   `json:"full_description"`
+		VideoImageURL   *string   `json:"video_image_url"`
+		VideoLink       *string   `json:"video_link"`
+		CreatedAt       time.Time `json:"created_at"`
+		UpdatedAt       time.Time `json:"updated_at"`
+	}
+
+	items := make([]tuningItem, 0, 8)
+	for rows.Next() {
+		var item tuningItem
+		var brand sql.NullString
+		var model sql.NullString
+		var title sql.NullString
+		var cardImageURL sql.NullString
+		var fullImageURLRaw []byte
+		var price sql.NullString
+		var description sql.NullString
+		var cardDescription sql.NullString
+		var fullDescription sql.NullString
+		var videoImageURL sql.NullString
+		var videoLink sql.NullString
+
+		if err := rows.Scan(
+			&item.ID,
+			&brand,
+			&model,
+			&title,
+			&cardImageURL,
+			&fullImageURLRaw,
+			&description,
+			&cardDescription,
+			&fullDescription,
+			&videoImageURL,
+			&videoLink,
+			&price,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+		); err != nil {
+			http.Error(w, "failed to read tuning", http.StatusInternalServerError)
+			return
+		}
+
+		item.Brand = nullableString(brand)
+		item.Model = nullableString(model)
+		item.Title = nullableString(title)
+		item.CardImageURL = nullableString(cardImageURL)
+		item.FullImageURL = parseStringArray(fullImageURLRaw)
+		item.Price = nullableString(price)
+		item.Description = nullableString(description)
+		item.CardDescription = nullableString(cardDescription)
+		item.FullDescription = nullableString(fullDescription)
+		item.VideoImageURL = nullableString(videoImageURL)
+		item.VideoLink = nullableString(videoLink)
+
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, "failed to read tuning", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(items); err != nil {
+		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+		return
+	}
+}
+
 func (a *App) portfolioItemsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -464,6 +592,97 @@ func (a *App) workPostHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *App) serviceOfferingsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	queries := []string{
+		`SELECT id, service_type, title, detailed_description, gallery_images, price_text, position, created_at, updated_at
+		FROM public.service_offerings
+		ORDER BY position ASC, id ASC`,
+		`SELECT id, service_type, title, detailed_description, gallery_images, price_text, position, NOW() AS created_at, NOW() AS updated_at
+		FROM public.service_offerings
+		ORDER BY position ASC, id ASC`,
+		`SELECT id, service_type, title, detailed_description, NULL::jsonb AS gallery_images, price_text, position, NOW() AS created_at, NOW() AS updated_at
+		FROM public.service_offerings
+		ORDER BY position ASC, id ASC`,
+	}
+
+	var rows *sql.Rows
+	var err error
+	for _, query := range queries {
+		rows, err = a.DB.QueryContext(ctx, query)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		http.Error(w, "failed to fetch service offerings", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type serviceOffering struct {
+		ID                  int       `json:"id"`
+		ServiceType         *string   `json:"service_type"`
+		Title               *string   `json:"title"`
+		DetailedDescription *string   `json:"detailed_description"`
+		GalleryImages       []string  `json:"gallery_images"`
+		PriceText           *string   `json:"price_text"`
+		Position            int       `json:"position"`
+		CreatedAt           time.Time `json:"created_at"`
+		UpdatedAt           time.Time `json:"updated_at"`
+	}
+
+	items := make([]serviceOffering, 0, 8)
+	for rows.Next() {
+		var item serviceOffering
+		var serviceType sql.NullString
+		var title sql.NullString
+		var detailedDescription sql.NullString
+		var galleryImagesRaw []byte
+		var priceText sql.NullString
+
+		if err := rows.Scan(
+			&item.ID,
+			&serviceType,
+			&title,
+			&detailedDescription,
+			&galleryImagesRaw,
+			&priceText,
+			&item.Position,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+		); err != nil {
+			http.Error(w, "failed to read service offerings", http.StatusInternalServerError)
+			return
+		}
+
+		item.ServiceType = nullableString(serviceType)
+		item.Title = nullableString(title)
+		item.DetailedDescription = nullableString(detailedDescription)
+		item.GalleryImages = parseStringArray(galleryImagesRaw)
+		item.PriceText = nullableString(priceText)
+
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, "failed to read service offerings", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(items); err != nil {
+		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+		return
+	}
+}
+
 // rootHandler gives a friendly response for "/" instead of 404.
 func (a *App) rootHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
@@ -471,7 +690,7 @@ func (a *App) rootHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/banners","/partners","/portfolio_items","/work_post"]}`))
+	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/banners","/partners","/tuning","/service_offerings","/portfolio_items","/work_post"]}`))
 }
 
 func openDB(dsn string) (*sql.DB, error) {
@@ -586,11 +805,36 @@ func parseStringArray(raw []byte) []string {
 	}
 
 	var items []string
-	if err := json.Unmarshal(raw, &items); err != nil {
-		return []string{}
+	if err := json.Unmarshal(raw, &items); err == nil {
+		result := make([]string, 0, len(items))
+		for _, item := range items {
+			clean := strings.TrimSpace(item)
+			if clean == "" {
+				continue
+			}
+			result = append(result, clean)
+		}
+		return result
 	}
 
-	return uniqueNonEmpty(items...)
+	// Handle case when JSONB contains a string with encoded JSON array.
+	var encoded string
+	if err := json.Unmarshal(raw, &encoded); err == nil {
+		var nested []string
+		if err := json.Unmarshal([]byte(encoded), &nested); err == nil {
+			result := make([]string, 0, len(nested))
+			for _, item := range nested {
+				clean := strings.TrimSpace(item)
+				if clean == "" {
+					continue
+				}
+				result = append(result, clean)
+			}
+			return result
+		}
+	}
+
+	return []string{}
 }
 
 func resolveWorkPostTable(ctx context.Context, db *sql.DB) (string, error) {
@@ -610,6 +854,27 @@ func resolveWorkPostTable(ctx context.Context, db *sql.DB) (string, error) {
 	}
 	if blogPosts.Valid && strings.TrimSpace(blogPosts.String) != "" {
 		return "blog_posts", nil
+	}
+	return "", nil
+}
+
+func resolveTuningTable(ctx context.Context, db *sql.DB) (string, error) {
+	var tuning sql.NullString
+	var tunning sql.NullString
+
+	err := db.QueryRowContext(
+		ctx,
+		`SELECT to_regclass('public.tuning')::text, to_regclass('public.tunning')::text`,
+	).Scan(&tuning, &tunning)
+	if err != nil {
+		return "", err
+	}
+
+	if tuning.Valid && strings.TrimSpace(tuning.String) != "" {
+		return "tuning", nil
+	}
+	if tunning.Valid && strings.TrimSpace(tunning.String) != "" {
+		return "tunning", nil
 	}
 	return "", nil
 }
