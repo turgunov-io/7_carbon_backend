@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -13,6 +15,8 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,9 +33,12 @@ type App struct {
 var phonePattern = regexp.MustCompile(`^\+?[0-9]{7,15}$`)
 
 const (
-	healthTimeout = 5 * time.Second
-	readTimeout   = 10 * time.Second
-	writeTimeout  = 12 * time.Second
+	healthTimeout       = 5 * time.Second
+	readTimeout         = 10 * time.Second
+	writeTimeout        = 12 * time.Second
+	storageUploadMaxMB  = 25
+	defaultStorageLimit = 50
+	maxStorageLimit     = 500
 )
 
 func main() {
@@ -69,6 +76,10 @@ func main() {
 	mux.HandleFunc("/api/consultations", app.consultationsHandler)
 	mux.HandleFunc("/portfolio_items", app.portfolioItemsHandler)
 	mux.HandleFunc("/work_post", app.workPostHandler)
+	app.registerAdminCRUDRoutes(mux)
+	mux.HandleFunc("/admin/storage/upload", app.adminStorageUploadHandler)
+	mux.HandleFunc("/admin/storage/files", app.adminStorageListHandler)
+	mux.HandleFunc("/admin/storage/file", app.adminStorageDeleteHandler)
 
 	server := &http.Server{
 		Addr:         ":" + firstNonEmpty(os.Getenv("PORT"), "8080"),
@@ -1146,7 +1157,1242 @@ func (a *App) rootHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/about","/banners","/partners","/tuning","/service_offerings","/privacy_sections","/api/consultations","/portfolio_items","/work_post"]}`))
+	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/about","/banners","/partners","/tuning","/service_offerings","/privacy_sections","/api/consultations","/portfolio_items","/work_post","/admin/*","/admin/storage/*"]}`))
+}
+
+type tableCRUDConfig struct {
+	Path             string
+	Table            string
+	OrderBy          string
+	MutableColumns   map[string]struct{}
+	RequiredOnCreate map[string]struct{}
+	JSONColumns      map[string]struct{}
+	TouchUpdatedAt   bool
+}
+
+func columnSet(values ...string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	return set
+}
+
+func (a *App) registerAdminCRUDRoutes(mux *http.ServeMux) {
+	configs := []tableCRUDConfig{
+		{
+			Path:             "/admin/banners",
+			Table:            "public.banners",
+			OrderBy:          "t.priority ASC, t.id ASC",
+			MutableColumns:   columnSet("section", "title", "image_url", "priority"),
+			RequiredOnCreate: columnSet("section", "title", "image_url"),
+		},
+		{
+			Path:             "/admin/contact",
+			Table:            "public.contact",
+			OrderBy:          "t.id ASC",
+			MutableColumns:   columnSet("phone_number", "address", "description", "email", "work_schedule"),
+			RequiredOnCreate: columnSet(),
+		},
+		{
+			Path:             "/admin/contact_page",
+			Table:            "public.contact_page",
+			OrderBy:          "t.id ASC",
+			MutableColumns:   columnSet("id", "phone_number", "address", "description", "image_url"),
+			RequiredOnCreate: columnSet(),
+		},
+		{
+			Path:             "/admin/about_page",
+			Table:            "public.about_page",
+			OrderBy:          "t.id ASC",
+			MutableColumns:   columnSet("id", "banner_image_url", "banner_title", "history_description", "video_url", "mission_description", "mission_image_url"),
+			RequiredOnCreate: columnSet(),
+		},
+		{
+			Path:             "/admin/about_metrics",
+			Table:            "public.about_metrics",
+			OrderBy:          "t.position ASC, t.id ASC",
+			MutableColumns:   columnSet("about_id", "metric_key", "metric_value", "metric_label", "position"),
+			RequiredOnCreate: columnSet("metric_key", "metric_value", "metric_label"),
+		},
+		{
+			Path:             "/admin/about_sections",
+			Table:            "public.about_sections",
+			OrderBy:          "t.position ASC, t.id ASC",
+			MutableColumns:   columnSet("about_id", "section_key", "title", "description", "position"),
+			RequiredOnCreate: columnSet("section_key", "title", "description"),
+		},
+		{
+			Path:             "/admin/partners",
+			Table:            "public.partners",
+			OrderBy:          "t.position ASC, t.id ASC",
+			MutableColumns:   columnSet("name", "logo_url", "position"),
+			RequiredOnCreate: columnSet("logo_url"),
+		},
+		{
+			Path:             "/admin/tuning",
+			Table:            "public.tuning",
+			OrderBy:          "t.created_at DESC, t.id DESC",
+			MutableColumns:   columnSet("brand", "model", "card_image_url", "full_image_url", "price", "description", "card_description", "full_description", "video_image_url", "video_link"),
+			RequiredOnCreate: columnSet(),
+			JSONColumns:      columnSet("full_image_url"),
+			TouchUpdatedAt:   true,
+		},
+		{
+			Path:             "/admin/service_offerings",
+			Table:            "public.service_offerings",
+			OrderBy:          "t.position ASC, t.id ASC",
+			MutableColumns:   columnSet("service_type", "title", "detailed_description", "gallery_images", "price_text", "position"),
+			RequiredOnCreate: columnSet("service_type", "title"),
+			JSONColumns:      columnSet("gallery_images"),
+			TouchUpdatedAt:   true,
+		},
+		{
+			Path:             "/admin/privacy_sections",
+			Table:            "public.privacy_sections",
+			OrderBy:          "t.position ASC, t.id ASC",
+			MutableColumns:   columnSet("title", "description", "position"),
+			RequiredOnCreate: columnSet("title", "description"),
+		},
+		{
+			Path:             "/admin/portfolio_items",
+			Table:            "public.portfolio_items",
+			OrderBy:          "t.created_at DESC, t.id DESC",
+			MutableColumns:   columnSet("brand", "title", "image_url", "description", "youtube_link"),
+			RequiredOnCreate: columnSet("title", "image_url"),
+		},
+		{
+			Path:             "/admin/work_post",
+			Table:            "public.work_post",
+			OrderBy:          "t.created_at DESC, t.id DESC",
+			MutableColumns:   columnSet("title_model", "card_image_url", "full_image_url", "card_description", "work_list", "gallery_images", "full_description", "video_image_url", "video_link"),
+			RequiredOnCreate: columnSet("title_model"),
+			JSONColumns:      columnSet("work_list", "gallery_images"),
+			TouchUpdatedAt:   true,
+		},
+		{
+			Path:             "/admin/blog_posts",
+			Table:            "public.blog_posts",
+			OrderBy:          "t.created_at DESC, t.id DESC",
+			MutableColumns:   columnSet("title_model", "card_image_url", "full_image_url", "card_description", "work_list", "gallery_images", "full_description", "video_image_url", "video_link"),
+			RequiredOnCreate: columnSet("title_model"),
+			JSONColumns:      columnSet("work_list", "gallery_images"),
+			TouchUpdatedAt:   true,
+		},
+		{
+			Path:             "/admin/consultations",
+			Table:            "public.consultations",
+			OrderBy:          "t.created_at DESC, t.id DESC",
+			MutableColumns:   columnSet("first_name", "last_name", "phone", "service_type", "car_model", "preferred_call_time", "comments", "status"),
+			RequiredOnCreate: columnSet("first_name", "last_name", "phone", "service_type"),
+		},
+	}
+
+	for _, cfg := range configs {
+		config := cfg
+		handler := a.makeAdminTableCRUDHandler(config)
+		mux.HandleFunc(config.Path, handler)
+		mux.HandleFunc(config.Path+"/", handler)
+	}
+}
+
+func (a *App) makeAdminTableCRUDHandler(cfg tableCRUDConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, hasID, err := parseResourceID(r, cfg.Path)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"status":  "error",
+				"message": "invalid id",
+			})
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			if hasID {
+				a.adminFetchOne(w, r, cfg, id)
+				return
+			}
+			a.adminFetchMany(w, r, cfg)
+		case http.MethodPost:
+			a.adminCreateOne(w, r, cfg)
+		case http.MethodPut, http.MethodPatch:
+			if !hasID {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"status":  "error",
+					"message": "id is required",
+				})
+				return
+			}
+			a.adminUpdateOne(w, r, cfg, id)
+		case http.MethodDelete:
+			if !hasID {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"status":  "error",
+					"message": "id is required",
+				})
+				return
+			}
+			a.adminDeleteOne(w, r, cfg, id)
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+				"status":  "error",
+				"message": "method not allowed",
+			})
+		}
+	}
+}
+
+func (a *App) adminFetchMany(w http.ResponseWriter, r *http.Request, cfg tableCRUDConfig) {
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
+	defer cancel()
+
+	orderBy := strings.TrimSpace(cfg.OrderBy)
+	if orderBy == "" {
+		orderBy = "t.id ASC"
+	}
+
+	var raw []byte
+	if err := a.queryAdminList(ctx, cfg.Table, orderBy, &raw); err != nil {
+		if orderBy != "t.id ASC" {
+			log.Printf("admin list %s failed with order '%s': %v; retry with id ASC", cfg.Table, orderBy, err)
+			if retryErr := a.queryAdminList(ctx, cfg.Table, "t.id ASC", &raw); retryErr != nil {
+				log.Printf("admin list %s retry failed: %v", cfg.Table, retryErr)
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"status":  "error",
+					"message": "failed to fetch data",
+				})
+				return
+			}
+		} else {
+			log.Printf("admin list %s failed: %v", cfg.Table, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"status":  "error",
+				"message": "failed to fetch data",
+			})
+			return
+		}
+	}
+
+	var data any
+	if len(raw) == 0 {
+		data = []any{}
+	} else if err := json.Unmarshal(raw, &data); err != nil {
+		log.Printf("admin list %s decode failed: %v", cfg.Table, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to parse data",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"data":   data,
+	})
+}
+
+func (a *App) queryAdminList(ctx context.Context, tableName, orderBy string, out *[]byte) error {
+	query := fmt.Sprintf(
+		`SELECT COALESCE(json_agg(to_jsonb(t) ORDER BY %s), '[]'::json) FROM %s t`,
+		orderBy,
+		quoteTableName(tableName),
+	)
+	return a.DB.QueryRowContext(ctx, query).Scan(out)
+}
+
+func (a *App) adminFetchOne(w http.ResponseWriter, r *http.Request, cfg tableCRUDConfig, id int64) {
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
+	defer cancel()
+
+	query := fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE t.id = $1`, quoteTableName(cfg.Table))
+
+	var raw []byte
+	if err := a.DB.QueryRowContext(ctx, query, id).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]any{
+				"status":  "error",
+				"message": "record not found",
+			})
+			return
+		}
+		log.Printf("admin fetch one %s failed: %v", cfg.Table, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to fetch data",
+		})
+		return
+	}
+
+	var data any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		log.Printf("admin fetch one %s decode failed: %v", cfg.Table, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to parse data",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"data":   data,
+	})
+}
+
+func (a *App) adminCreateOne(w http.ResponseWriter, r *http.Request, cfg tableCRUDConfig) {
+	ctx, cancel := context.WithTimeout(r.Context(), writeTimeout)
+	defer cancel()
+
+	payload, ok := decodeJSONMap(w, r)
+	if !ok {
+		return
+	}
+
+	if validationErrors := validateCRUDPayload(payload, cfg.MutableColumns, cfg.RequiredOnCreate); len(validationErrors) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"status":  "error",
+			"message": "validation error",
+			"errors":  validationErrors,
+		})
+		return
+	}
+
+	keys := sortedMapKeys(payload)
+	quotedTable := quoteTableName(cfg.Table)
+
+	query := ""
+	args := make([]any, 0, len(keys))
+	if len(keys) == 0 {
+		query = fmt.Sprintf(
+			`WITH ins AS (INSERT INTO %s DEFAULT VALUES RETURNING *) SELECT to_jsonb(ins) FROM ins`,
+			quotedTable,
+		)
+	} else {
+		columns := make([]string, 0, len(keys))
+		placeholders := make([]string, 0, len(keys))
+		for idx, key := range keys {
+			columns = append(columns, quoteIdentifier(key))
+			placeholders = append(placeholders, fmt.Sprintf("$%d", idx+1))
+
+			value, err := normalizeCRUDValue(key, payload[key], cfg)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"status":  "error",
+					"message": err.Error(),
+				})
+				return
+			}
+			args = append(args, value)
+		}
+
+		query = fmt.Sprintf(
+			`WITH ins AS (INSERT INTO %s (%s) VALUES (%s) RETURNING *) SELECT to_jsonb(ins) FROM ins`,
+			quotedTable,
+			strings.Join(columns, ", "),
+			strings.Join(placeholders, ", "),
+		)
+	}
+
+	var raw []byte
+	if err := a.DB.QueryRowContext(ctx, query, args...).Scan(&raw); err != nil {
+		log.Printf("admin create %s failed: %v", cfg.Table, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to create record",
+		})
+		return
+	}
+
+	var data any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		log.Printf("admin create %s decode failed: %v", cfg.Table, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to parse created record",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"status": "success",
+		"data":   data,
+	})
+}
+
+func (a *App) adminUpdateOne(w http.ResponseWriter, r *http.Request, cfg tableCRUDConfig, id int64) {
+	ctx, cancel := context.WithTimeout(r.Context(), writeTimeout)
+	defer cancel()
+
+	payload, ok := decodeJSONMap(w, r)
+	if !ok {
+		return
+	}
+
+	if validationErrors := validateCRUDPayload(payload, cfg.MutableColumns, nil); len(validationErrors) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"status":  "error",
+			"message": "validation error",
+			"errors":  validationErrors,
+		})
+		return
+	}
+
+	keys := sortedMapKeys(payload)
+	if len(keys) == 0 && !cfg.TouchUpdatedAt {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "empty payload",
+		})
+		return
+	}
+
+	setClauses := make([]string, 0, len(keys)+1)
+	args := make([]any, 0, len(keys)+1)
+	for idx, key := range keys {
+		value, err := normalizeCRUDValue(key, payload[key], cfg)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"status":  "error",
+				"message": err.Error(),
+			})
+			return
+		}
+		args = append(args, value)
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", quoteIdentifier(key), idx+1))
+	}
+	if cfg.TouchUpdatedAt {
+		setClauses = append(setClauses, `updated_at = NOW()`)
+	}
+
+	query := fmt.Sprintf(
+		`WITH upd AS (UPDATE %s SET %s WHERE id = $%d RETURNING *) SELECT to_jsonb(upd) FROM upd`,
+		quoteTableName(cfg.Table),
+		strings.Join(setClauses, ", "),
+		len(args)+1,
+	)
+	args = append(args, id)
+
+	var raw []byte
+	if err := a.DB.QueryRowContext(ctx, query, args...).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]any{
+				"status":  "error",
+				"message": "record not found",
+			})
+			return
+		}
+		log.Printf("admin update %s failed: %v", cfg.Table, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to update record",
+		})
+		return
+	}
+
+	var data any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		log.Printf("admin update %s decode failed: %v", cfg.Table, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to parse updated record",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"data":   data,
+	})
+}
+
+func (a *App) adminDeleteOne(w http.ResponseWriter, r *http.Request, cfg tableCRUDConfig, id int64) {
+	ctx, cancel := context.WithTimeout(r.Context(), writeTimeout)
+	defer cancel()
+
+	query := fmt.Sprintf(
+		`WITH del AS (DELETE FROM %s WHERE id = $1 RETURNING *) SELECT to_jsonb(del) FROM del`,
+		quoteTableName(cfg.Table),
+	)
+
+	var raw []byte
+	if err := a.DB.QueryRowContext(ctx, query, id).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]any{
+				"status":  "error",
+				"message": "record not found",
+			})
+			return
+		}
+		log.Printf("admin delete %s failed: %v", cfg.Table, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to delete record",
+		})
+		return
+	}
+
+	var data any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		log.Printf("admin delete %s decode failed: %v", cfg.Table, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to parse deleted record",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"data":   data,
+	})
+}
+
+func parseResourceID(r *http.Request, basePath string) (int64, bool, error) {
+	if idParam := strings.TrimSpace(r.URL.Query().Get("id")); idParam != "" {
+		id, err := strconv.ParseInt(idParam, 10, 64)
+		if err != nil {
+			return 0, false, err
+		}
+		return id, true, nil
+	}
+
+	base := strings.TrimSuffix(basePath, "/")
+	path := strings.TrimSuffix(strings.TrimSpace(r.URL.Path), "/")
+	if path == base {
+		return 0, false, nil
+	}
+	if !strings.HasPrefix(path, base+"/") {
+		return 0, false, nil
+	}
+
+	idPart := strings.TrimPrefix(path, base+"/")
+	if idPart == "" {
+		return 0, false, nil
+	}
+	if strings.Contains(idPart, "/") {
+		return 0, false, fmt.Errorf("invalid id path")
+	}
+
+	id, err := strconv.ParseInt(idPart, 10, 64)
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
+
+func decodeJSONMap(w http.ResponseWriter, r *http.Request) (map[string]any, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	defer r.Body.Close()
+
+	var payload map[string]any
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "invalid JSON body",
+		})
+		return nil, false
+	}
+
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "expected a single JSON object",
+		})
+		return nil, false
+	}
+
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	return payload, true
+}
+
+func validateCRUDPayload(payload map[string]any, allowedColumns, requiredColumns map[string]struct{}) map[string]string {
+	validationErrors := map[string]string{}
+
+	for key := range payload {
+		if _, ok := allowedColumns[key]; !ok {
+			validationErrors[key] = "field is not editable"
+		}
+	}
+	for key := range requiredColumns {
+		value, ok := payload[key]
+		if !ok || isEmptyJSONValue(value) {
+			validationErrors[key] = "field is required"
+		}
+	}
+
+	return validationErrors
+}
+
+func isEmptyJSONValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	text, ok := value.(string)
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(text) == ""
+}
+
+func sortedMapKeys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func normalizeCRUDValue(column string, value any, cfg tableCRUDConfig) (any, error) {
+	if _, ok := cfg.JSONColumns[column]; ok {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid JSON value for %s", column)
+		}
+		return string(raw), nil
+	}
+
+	number, ok := value.(float64)
+	if ok && number == float64(int64(number)) {
+		return int64(number), nil
+	}
+
+	return value, nil
+}
+
+func quoteIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+func quoteTableName(value string) string {
+	parts := strings.Split(value, ".")
+	quoted := make([]string, 0, len(parts))
+	for _, part := range parts {
+		quoted = append(quoted, quoteIdentifier(strings.TrimSpace(part)))
+	}
+	return strings.Join(quoted, ".")
+}
+
+type supabaseStorageConfig struct {
+	BaseURL       string
+	ServiceRole   string
+	DefaultBucket string
+}
+
+func (a *App) adminStorageUploadHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireAdminToken(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+			"status":  "error",
+			"message": "method not allowed",
+		})
+		return
+	}
+
+	cfg, err := loadSupabaseStorageConfig()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	maxBytes := int64(storageUploadMaxMB) << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	if err := r.ParseMultipartForm(maxBytes); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "invalid multipart form",
+		})
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+
+	file, fileHeader, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "file is required (form-data key: file)",
+		})
+		return
+	}
+	defer file.Close()
+
+	bucketValue := firstNonEmpty(r.FormValue("bucket"), cfg.DefaultBucket)
+	bucket, err := cleanStorageBucket(bucketValue)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	filename := sanitizeFilename(firstNonEmpty(r.FormValue("filename"), fileHeader.Filename))
+	if filename == "" {
+		filename = fmt.Sprintf("upload_%d.bin", time.Now().UnixNano())
+	}
+
+	folder, err := cleanOptionalStoragePath(r.FormValue("folder"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	objectPath := filename
+	if folder != "" {
+		objectPath = folder + "/" + filename
+	}
+
+	contentType := strings.TrimSpace(fileHeader.Header.Get("Content-Type"))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	upsertValue := strings.TrimSpace(strings.ToLower(r.FormValue("upsert")))
+	upsert := upsertValue == "" || upsertValue == "1" || upsertValue == "true" || upsertValue == "yes"
+
+	uploadURL := buildSupabaseObjectURL(cfg.BaseURL, bucket, objectPath)
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, file)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to build upload request",
+		})
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.ServiceRole)
+	req.Header.Set("apikey", cfg.ServiceRole)
+	req.Header.Set("x-upsert", strconv.FormatBool(upsert))
+	req.Header.Set("Content-Type", contentType)
+	if fileHeader.Size > 0 {
+		req.ContentLength = fileHeader.Size
+	}
+
+	resp, err := (&http.Client{Timeout: 70 * time.Second}).Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"status":  "error",
+			"message": "storage upload request failed",
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"status":  "error",
+			"message": "storage upload failed",
+			"details": strings.TrimSpace(string(respBody)),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"status": "success",
+		"data": map[string]any{
+			"bucket":        bucket,
+			"path":          objectPath,
+			"mime_type":     contentType,
+			"size":          fileHeader.Size,
+			"upsert":        upsert,
+			"storage_url":   buildSupabaseObjectURL(cfg.BaseURL, bucket, objectPath),
+			"public_url":    buildSupabasePublicURL(cfg.BaseURL, bucket, objectPath),
+			"storage_reply": strings.TrimSpace(string(respBody)),
+		},
+	})
+}
+
+func (a *App) adminStorageListHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireAdminToken(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+			"status":  "error",
+			"message": "method not allowed",
+		})
+		return
+	}
+
+	cfg, err := loadSupabaseStorageConfig()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	prefix, err := cleanOptionalStoragePath(r.URL.Query().Get("prefix"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	limit, err := parseIntOrDefault(r.URL.Query().Get("limit"), defaultStorageLimit)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "limit must be an integer",
+		})
+		return
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > maxStorageLimit {
+		limit = maxStorageLimit
+	}
+
+	offset, err := parseIntOrDefault(r.URL.Query().Get("offset"), 0)
+	if err != nil || offset < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "offset must be a non-negative integer",
+		})
+		return
+	}
+
+	sortColumn := firstNonEmpty(strings.TrimSpace(r.URL.Query().Get("sort_column")), "name")
+	sortOrder := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort_order")))
+	if sortOrder != "desc" {
+		sortOrder = "asc"
+	}
+
+	opts := storageListOptions{
+		Prefix:     prefix,
+		Limit:      limit,
+		Offset:     offset,
+		SortColumn: sortColumn,
+		SortOrder:  sortOrder,
+		Search:     strings.TrimSpace(r.URL.Query().Get("search")),
+	}
+
+	allBuckets := isTruthy(r.URL.Query().Get("all"))
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
+	defer cancel()
+
+	if allBuckets {
+		buckets, err := a.supabaseListBuckets(ctx, cfg)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"status":  "error",
+				"message": "failed to fetch buckets",
+				"details": err.Error(),
+			})
+			return
+		}
+
+		items := make(map[string]any, len(buckets))
+		for _, bucket := range buckets {
+			data, err := a.supabaseListBucketFiles(ctx, cfg, bucket, opts)
+			if err != nil {
+				items[bucket] = map[string]any{
+					"status":  "error",
+					"message": err.Error(),
+				}
+				continue
+			}
+			items[bucket] = data
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "success",
+			"data":   items,
+			"meta": map[string]any{
+				"all":            true,
+				"bucket_count":   len(buckets),
+				"per_bucket_max": opts.Limit,
+				"prefix":         opts.Prefix,
+			},
+		})
+		return
+	}
+
+	bucketValue := firstNonEmpty(r.URL.Query().Get("bucket"), cfg.DefaultBucket)
+	bucket, err := cleanStorageBucket(bucketValue)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	data, err := a.supabaseListBucketFiles(ctx, cfg, bucket, opts)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"status":  "error",
+			"message": "storage list failed",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"data":   data,
+		"meta": map[string]any{
+			"bucket": bucket,
+			"prefix": prefix,
+			"limit":  limit,
+			"offset": offset,
+		},
+	})
+}
+
+type storageListOptions struct {
+	Prefix     string
+	Limit      int
+	Offset     int
+	SortColumn string
+	SortOrder  string
+	Search     string
+}
+
+func (a *App) supabaseListBuckets(ctx context.Context, cfg supabaseStorageConfig) ([]string, error) {
+	listURL := fmt.Sprintf("%s/storage/v1/bucket", strings.TrimRight(cfg.BaseURL, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build buckets request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.ServiceRole)
+	req.Header.Set("apikey", cfg.ServiceRole)
+
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("buckets request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("buckets request status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var payload []map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("decode buckets response: %w", err)
+	}
+
+	buckets := make([]string, 0, len(payload))
+	for _, bucket := range payload {
+		name, _ := bucket["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		buckets = append(buckets, name)
+	}
+	sort.Strings(buckets)
+	return buckets, nil
+}
+
+func (a *App) supabaseListBucketFiles(ctx context.Context, cfg supabaseStorageConfig, bucket string, opts storageListOptions) (any, error) {
+	payload := map[string]any{
+		"prefix": opts.Prefix,
+		"limit":  opts.Limit,
+		"offset": opts.Offset,
+		"sortBy": map[string]any{
+			"column": opts.SortColumn,
+			"order":  opts.SortOrder,
+		},
+	}
+	if opts.Search != "" {
+		payload["search"] = opts.Search
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("build list payload: %w", err)
+	}
+
+	listURL := fmt.Sprintf("%s/storage/v1/object/list/%s", strings.TrimRight(cfg.BaseURL, "/"), url.PathEscape(bucket))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, listURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build list request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.ServiceRole)
+	req.Header.Set("apikey", cfg.ServiceRole)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("list request status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	if len(raw) == 0 {
+		return []any{}, nil
+	}
+
+	var data any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return nil, fmt.Errorf("decode list response: %w", err)
+	}
+	return data, nil
+}
+
+func (a *App) adminStorageDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireAdminToken(w, r) {
+		return
+	}
+	if r.Method != http.MethodDelete {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+			"status":  "error",
+			"message": "method not allowed",
+		})
+		return
+	}
+
+	cfg, err := loadSupabaseStorageConfig()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	bucketValue := firstNonEmpty(r.URL.Query().Get("bucket"), cfg.DefaultBucket)
+	bucket, err := cleanStorageBucket(bucketValue)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	objectPath, err := cleanStoragePath(r.URL.Query().Get("path"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "query param path is required",
+		})
+		return
+	}
+
+	deleteURL := buildSupabaseObjectURL(cfg.BaseURL, bucket, objectPath)
+	ctx, cancel := context.WithTimeout(r.Context(), writeTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, deleteURL, nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to build delete request",
+		})
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.ServiceRole)
+	req.Header.Set("apikey", cfg.ServiceRole)
+
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"status":  "error",
+			"message": "storage delete request failed",
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"status":  "error",
+			"message": "storage delete failed",
+			"details": strings.TrimSpace(string(raw)),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"data": map[string]any{
+			"bucket": bucket,
+			"path":   objectPath,
+		},
+	})
+}
+
+func requireAdminToken(w http.ResponseWriter, r *http.Request) bool {
+	expected := strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
+	if expected == "" {
+		return true
+	}
+
+	provided := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
+	if provided == "" {
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		if len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
+			provided = strings.TrimSpace(auth[7:])
+		}
+	}
+
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"status":  "error",
+			"message": "unauthorized",
+		})
+		return false
+	}
+
+	return true
+}
+
+func loadSupabaseStorageConfig() (supabaseStorageConfig, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("SUPABASE_URL")), "/")
+	serviceRole := strings.TrimSpace(os.Getenv("SUPABASE_SERVICE_ROLE_KEY"))
+	defaultBucket := strings.TrimSpace(os.Getenv("STORAGE_BUCKET"))
+	if defaultBucket == "" {
+		defaultBucket = "cars"
+	}
+
+	if baseURL == "" {
+		return supabaseStorageConfig{}, errors.New("SUPABASE_URL is not set")
+	}
+	if serviceRole == "" {
+		return supabaseStorageConfig{}, errors.New("SUPABASE_SERVICE_ROLE_KEY is not set")
+	}
+
+	return supabaseStorageConfig{
+		BaseURL:       baseURL,
+		ServiceRole:   serviceRole,
+		DefaultBucket: defaultBucket,
+	}, nil
+}
+
+func cleanStorageBucket(value string) (string, error) {
+	bucket := strings.TrimSpace(value)
+	if bucket == "" {
+		return "", errors.New("bucket is required")
+	}
+	if strings.ContainsAny(bucket, `/\`) || strings.Contains(bucket, "..") {
+		return "", errors.New("invalid bucket")
+	}
+	return bucket, nil
+}
+
+func cleanOptionalStoragePath(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", nil
+	}
+	return cleanStoragePath(trimmed)
+}
+
+func cleanStoragePath(value string) (string, error) {
+	candidate := strings.TrimSpace(strings.ReplaceAll(value, `\`, `/`))
+	candidate = strings.Trim(candidate, "/")
+	if candidate == "" {
+		return "", errors.New("path is required")
+	}
+
+	parts := strings.Split(candidate, "/")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		clean := strings.TrimSpace(part)
+		if clean == "" {
+			continue
+		}
+		if clean == "." || clean == ".." {
+			return "", errors.New("invalid path")
+		}
+		result = append(result, clean)
+	}
+	if len(result) == 0 {
+		return "", errors.New("path is required")
+	}
+
+	return strings.Join(result, "/"), nil
+}
+
+func sanitizeFilename(value string) string {
+	name := strings.TrimSpace(strings.ReplaceAll(value, `\`, `/`))
+	if name == "" {
+		return ""
+	}
+	parts := strings.Split(name, "/")
+	base := strings.TrimSpace(parts[len(parts)-1])
+	base = strings.Trim(base, ".")
+	if base == "" || base == "." || base == ".." {
+		return ""
+	}
+	return base
+}
+
+func buildSupabaseObjectURL(baseURL, bucket, objectPath string) string {
+	return fmt.Sprintf(
+		"%s/storage/v1/object/%s/%s",
+		strings.TrimRight(baseURL, "/"),
+		url.PathEscape(bucket),
+		encodeStoragePath(objectPath),
+	)
+}
+
+func buildSupabasePublicURL(baseURL, bucket, objectPath string) string {
+	return fmt.Sprintf(
+		"%s/storage/v1/object/public/%s/%s",
+		strings.TrimRight(baseURL, "/"),
+		url.PathEscape(bucket),
+		encodeStoragePath(objectPath),
+	)
+}
+
+func encodeStoragePath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return strings.Join(parts, "/")
+}
+
+func parseIntOrDefault(raw string, fallback int) (int, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return fallback, nil
+	}
+	number, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, err
+	}
+	return number, nil
+}
+
+func isTruthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func openDB(dsn string) (*sql.DB, error) {
