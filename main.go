@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -27,6 +28,12 @@ type App struct {
 
 var phonePattern = regexp.MustCompile(`^\+?[0-9]{7,15}$`)
 
+const (
+	healthTimeout = 5 * time.Second
+	readTimeout   = 10 * time.Second
+	writeTimeout  = 12 * time.Second
+)
+
 func main() {
 	if err := loadDotEnv(); err != nil {
 		log.Printf("warning: could not load .env: %v", err)
@@ -39,6 +46,7 @@ func main() {
 	if dsn == "" {
 		log.Fatal("DATABASE_URL or POSTGRES_DSN must be set")
 	}
+	dsn = normalizeDSN(dsn)
 
 	db, err := openDB(dsn)
 	if err != nil {
@@ -96,7 +104,7 @@ func main() {
 }
 
 func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), healthTimeout)
 	defer cancel()
 
 	if err := a.DB.PingContext(ctx); err != nil {
@@ -114,14 +122,28 @@ func (a *App) bannersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
 	defer cancel()
 
-	rows, err := a.DB.QueryContext(
-		ctx,
-		`SELECT id, section, title, image_url, priority FROM banners ORDER BY priority ASC, id ASC`,
-	)
+	queries := []string{
+		`SELECT id, section, title, COALESCE(to_jsonb(b)->>'image_url', to_jsonb(b)->>'image') AS image_url, priority
+		FROM public.banners b
+		ORDER BY priority ASC, id ASC`,
+		`SELECT id, section, title, COALESCE(to_jsonb(b)->>'image_url', to_jsonb(b)->>'image') AS image_url, priority
+		FROM banners b
+		ORDER BY priority ASC, id ASC`,
+	}
+
+	var rows *sql.Rows
+	var err error
+	for _, query := range queries {
+		rows, err = a.DB.QueryContext(ctx, query)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
+		log.Printf("banners query failed: %v", err)
 		http.Error(w, "failed to fetch banners", http.StatusInternalServerError)
 		return
 	}
@@ -162,20 +184,20 @@ func (a *App) contactHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
 	defer cancel()
 
 	rows, err := a.DB.QueryContext(
 		ctx,
 		`SELECT id, phone_number, address, description, email, work_schedule
-		FROM contact
+		FROM public.contact
 		ORDER BY id ASC`,
 	)
 	if err != nil {
 		rows, err = a.DB.QueryContext(
 			ctx,
 			`SELECT id, phone_number, address, description, NULL::text AS email, NULL::text AS work_schedule
-			FROM contact_page
+			FROM public.contact_page
 			ORDER BY id ASC`,
 		)
 	}
@@ -241,7 +263,7 @@ func (a *App) aboutHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
 	defer cancel()
 
 	type aboutPage struct {
@@ -407,12 +429,12 @@ func (a *App) partnersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
 	defer cancel()
 
 	rows, err := a.DB.QueryContext(
 		ctx,
-		`SELECT id, logo_url FROM partners ORDER BY id ASC`,
+		`SELECT id, logo_url FROM public.partners ORDER BY id ASC`,
 	)
 	if err != nil {
 		http.Error(w, "failed to fetch partners", http.StatusInternalServerError)
@@ -452,7 +474,7 @@ func (a *App) tuningHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
 	defer cancel()
 
 	queries := []string{
@@ -578,13 +600,13 @@ func (a *App) portfolioItemsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
 	defer cancel()
 
 	rows, err := a.DB.QueryContext(
 		ctx,
 		`SELECT id, brand, title, image_url, description, youtube_link, created_at
-		FROM portfolio_items
+		FROM public.portfolio_items
 		ORDER BY created_at DESC, id DESC`,
 	)
 	if err != nil {
@@ -647,7 +669,7 @@ func (a *App) workPostHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
 	defer cancel()
 
 	tableName, err := resolveWorkPostTable(ctx, a.DB)
@@ -667,19 +689,19 @@ func (a *App) workPostHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := `SELECT id, title_model, card_image_url, full_image_url, card_description, work_list, full_description, video_image_url, video_link, NULL::jsonb AS gallery_images, created_at, updated_at
-		FROM blog_posts
+		FROM public.blog_posts
 		ORDER BY created_at DESC, id DESC`
 	if tableName == "work_post" && hasGalleryImages {
 		query = `SELECT id, title_model, card_image_url, full_image_url, card_description, work_list, full_description, video_image_url, video_link, gallery_images, created_at, updated_at
-		FROM work_post
+		FROM public.work_post
 		ORDER BY created_at DESC, id DESC`
 	} else if tableName == "work_post" {
 		query = `SELECT id, title_model, card_image_url, full_image_url, card_description, work_list, full_description, video_image_url, video_link, NULL::jsonb AS gallery_images, created_at, updated_at
-		FROM work_post
+		FROM public.work_post
 		ORDER BY created_at DESC, id DESC`
 	} else if tableName == "blog_posts" && hasGalleryImages {
 		query = `SELECT id, title_model, card_image_url, full_image_url, card_description, work_list, full_description, video_image_url, video_link, gallery_images, created_at, updated_at
-		FROM blog_posts
+		FROM public.blog_posts
 		ORDER BY created_at DESC, id DESC`
 	}
 
@@ -772,7 +794,7 @@ func (a *App) serviceOfferingsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
 	defer cancel()
 
 	queries := []string{
@@ -863,7 +885,7 @@ func (a *App) privacySectionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
 	defer cancel()
 
 	rows, err := a.DB.QueryContext(
@@ -915,13 +937,13 @@ func (a *App) consultationsHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
 			"status":  "error",
-			"message": "Метод не поддерживается",
+			"message": "?????????? ???? ????????????????????????????",
 		})
 	}
 }
 
 func (a *App) createConsultationHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), writeTimeout)
 	defer cancel()
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB safety limit for JSON payload
@@ -943,9 +965,9 @@ func (a *App) createConsultationHandler(w http.ResponseWriter, r *http.Request) 
 	if err := decoder.Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"status":  "error",
-			"message": "Некорректный JSON",
+			"message": "???????????????????????? JSON",
 			"errors": map[string]string{
-				"body": "Проверьте формат запроса",
+				"body": "?????????????????? ???????????? ??????????????",
 			},
 		})
 		return
@@ -954,9 +976,9 @@ func (a *App) createConsultationHandler(w http.ResponseWriter, r *http.Request) 
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"status":  "error",
-			"message": "Некорректный JSON",
+			"message": "???????????????????????? JSON",
 			"errors": map[string]string{
-				"body": "Ожидается один JSON-объект",
+				"body": "?????????????????? ???????? JSON-????????????",
 			},
 		})
 		return
@@ -974,7 +996,7 @@ func (a *App) createConsultationHandler(w http.ResponseWriter, r *http.Request) 
 	if len(errorsMap) > 0 {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 			"status":  "error",
-			"message": "Ошибка валидации",
+			"message": "???????????? ??????????????????",
 			"errors":  errorsMap,
 		})
 		return
@@ -1007,7 +1029,7 @@ func (a *App) createConsultationHandler(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"status":  "error",
-			"message": "Не удалось сохранить заявку",
+			"message": "???? ?????????????? ?????????????????? ????????????",
 		})
 		return
 	}
@@ -1027,7 +1049,7 @@ func (a *App) createConsultationHandler(w http.ResponseWriter, r *http.Request) 
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"status":  "success",
-		"message": "Заявка успешно создана",
+		"message": "???????????? ?????????????? ??????????????",
 		"data": map[string]any{
 			"id":         id,
 			"created_at": createdAt.UTC().Format(time.RFC3339),
@@ -1036,7 +1058,7 @@ func (a *App) createConsultationHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 func (a *App) listConsultationsHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), writeTimeout)
 	defer cancel()
 
 	statusFilter := strings.TrimSpace(r.URL.Query().Get("status"))
@@ -1053,7 +1075,7 @@ func (a *App) listConsultationsHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"status":  "error",
-			"message": "Не удалось получить заявки",
+			"message": "???? ?????????????? ???????????????? ????????????",
 		})
 		return
 	}
@@ -1093,7 +1115,7 @@ func (a *App) listConsultationsHandler(w http.ResponseWriter, r *http.Request) {
 		); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"status":  "error",
-				"message": "Не удалось прочитать заявки",
+				"message": "???? ?????????????? ?????????????????? ????????????",
 			})
 			return
 		}
@@ -1106,7 +1128,7 @@ func (a *App) listConsultationsHandler(w http.ResponseWriter, r *http.Request) {
 	if err := rows.Err(); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"status":  "error",
-			"message": "Не удалось прочитать заявки",
+			"message": "???? ?????????????? ?????????????????? ????????????",
 		})
 		return
 	}
@@ -1137,11 +1159,20 @@ func openDB(dsn string) (*sql.DB, error) {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(time.Hour)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
+	var pingErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		pingErr = db.PingContext(ctx)
+		cancel()
+		if pingErr == nil {
+			break
+		}
+		log.Printf("database ping attempt %d/3 failed: %v", attempt, pingErr)
+		time.Sleep(2 * time.Second)
+	}
+	if pingErr != nil {
 		db.Close()
-		return nil, err
+		return nil, pingErr
 	}
 	return db, nil
 }
@@ -1295,6 +1326,30 @@ func optionalStringValue(input string) *string {
 	return &trimmed
 }
 
+func normalizeDSN(dsn string) string {
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		return dsn
+	}
+
+	q := parsed.Query()
+	if strings.TrimSpace(q.Get("connect_timeout")) == "" {
+		q.Set("connect_timeout", "10")
+	}
+	if strings.TrimSpace(q.Get("sslmode")) == "" {
+		q.Set("sslmode", "require")
+	}
+	if strings.TrimSpace(q.Get("default_query_exec_mode")) == "" {
+		q.Set("default_query_exec_mode", "simple_protocol")
+	}
+	if strings.TrimSpace(q.Get("statement_cache_capacity")) == "" {
+		q.Set("statement_cache_capacity", "0")
+	}
+	parsed.RawQuery = q.Encode()
+
+	return parsed.String()
+}
+
 func validateConsultationRequest(firstName, lastName, phone, serviceType, carModel, preferredCallTime, comments string) map[string]string {
 	errs := map[string]string{}
 
@@ -1307,37 +1362,37 @@ func validateConsultationRequest(firstName, lastName, phone, serviceType, carMod
 	comments = strings.TrimSpace(comments)
 
 	if firstName == "" {
-		errs["first_name"] = "Поле обязательно"
+		errs["first_name"] = "???????? ??????????????????????"
 	} else if len([]rune(firstName)) > 100 {
-		errs["first_name"] = "Максимум 100 символов"
+		errs["first_name"] = "???????????????? 100 ????????????????"
 	}
 
 	if lastName == "" {
-		errs["last_name"] = "Поле обязательно"
+		errs["last_name"] = "???????? ??????????????????????"
 	} else if len([]rune(lastName)) > 100 {
-		errs["last_name"] = "Максимум 100 символов"
+		errs["last_name"] = "???????????????? 100 ????????????????"
 	}
 
 	if phone == "" {
-		errs["phone"] = "Поле обязательно"
+		errs["phone"] = "???????? ??????????????????????"
 	} else if !phonePattern.MatchString(phone) {
-		errs["phone"] = "Некорректный формат номера"
+		errs["phone"] = "???????????????????????? ???????????? ????????????"
 	}
 
 	if serviceType == "" {
-		errs["service_type"] = "Поле обязательно"
+		errs["service_type"] = "???????? ??????????????????????"
 	} else if len([]rune(serviceType)) > 80 {
-		errs["service_type"] = "Максимум 80 символов"
+		errs["service_type"] = "???????????????? 80 ????????????????"
 	}
 
 	if len([]rune(carModel)) > 120 {
-		errs["car_model"] = "Максимум 120 символов"
+		errs["car_model"] = "???????????????? 120 ????????????????"
 	}
 	if len([]rune(preferredCallTime)) > 120 {
-		errs["preferred_call_time"] = "Максимум 120 символов"
+		errs["preferred_call_time"] = "???????????????? 120 ????????????????"
 	}
 	if len([]rune(comments)) > 2000 {
-		errs["comments"] = "Максимум 2000 символов"
+		errs["comments"] = "???????????????? 2000 ????????????????"
 	}
 
 	return errs

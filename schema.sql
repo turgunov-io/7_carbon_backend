@@ -18,14 +18,6 @@ BEGIN;
 -- Optional but explicit.
 CREATE SCHEMA IF NOT EXISTS public;
 
--- 1. Navbar
-CREATE TABLE IF NOT EXISTS public.navbar_items (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    slug TEXT NOT NULL UNIQUE,
-    position INTEGER NOT NULL DEFAULT 0
-);
-
 -- 2. Banners (used by GET /banners)
 CREATE TABLE IF NOT EXISTS public.banners (
     id SERIAL PRIMARY KEY,
@@ -33,32 +25,6 @@ CREATE TABLE IF NOT EXISTS public.banners (
     title TEXT NOT NULL,
     image_url TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 0
-);
-
--- 3. Services taxonomy
-CREATE TABLE IF NOT EXISTS public.service_groups (
-    id SERIAL PRIMARY KEY,
-    title TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS public.service_categories (
-    id SERIAL PRIMARY KEY,
-    group_id INTEGER REFERENCES public.service_groups(id) ON DELETE SET NULL,
-    external_id TEXT UNIQUE,
-    slug TEXT UNIQUE,
-    title TEXT NOT NULL,
-    description TEXT,
-    image_url TEXT,
-    position INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS public.services (
-    id SERIAL PRIMARY KEY,
-    category_id INTEGER REFERENCES public.service_categories(id) ON DELETE SET NULL,
-    title TEXT NOT NULL,
-    description_html TEXT,
-    icon_url TEXT,
-    position INTEGER NOT NULL DEFAULT 0
 );
 
 -- 3.1 Service cards/details (type -> title -> detailed page content)
@@ -74,22 +40,6 @@ CREATE TABLE IF NOT EXISTS public.service_offerings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT service_offerings_gallery_images_is_array_chk
         CHECK (jsonb_typeof(gallery_images) = 'array')
-);
-
--- 4. Why us
-CREATE TABLE IF NOT EXISTS public.why_uct (
-    id SMALLINT PRIMARY KEY DEFAULT 1,
-    title TEXT NOT NULL,
-    description_html TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS public.why_uct_items (
-    id SERIAL PRIMARY KEY,
-    why_uct_id SMALLINT NOT NULL DEFAULT 1 REFERENCES public.why_uct(id) ON DELETE CASCADE,
-    icon_url TEXT,
-    title TEXT NOT NULL,
-    description_html TEXT NOT NULL,
-    position INTEGER NOT NULL DEFAULT 0
 );
 
 -- 5. Portfolio (used by GET /portfolio_items)
@@ -111,55 +61,12 @@ CREATE TABLE IF NOT EXISTS public.partners (
     position INTEGER NOT NULL DEFAULT 0
 );
 
--- 7. Footer
-CREATE TABLE IF NOT EXISTS public.footer_contacts (
-    id SERIAL PRIMARY KEY,
-    phone_number TEXT,
-    email TEXT,
-    logo_svg_url TEXT
-);
-
-CREATE TABLE IF NOT EXISTS public.footer_addresses (
-    id SERIAL PRIMARY KEY,
-    contact_id INTEGER REFERENCES public.footer_contacts(id) ON DELETE CASCADE,
-    address TEXT NOT NULL,
-    city TEXT,
-    country TEXT,
-    position INTEGER NOT NULL DEFAULT 0
-);
-
 -- 8. Tuning page
-CREATE TABLE IF NOT EXISTS public.tuning_page (
-    id SMALLINT PRIMARY KEY DEFAULT 1,
-    intro_description TEXT,
-    extra_description TEXT
-);
-
 CREATE TABLE IF NOT EXISTS public.tuning_cards (
     id SERIAL PRIMARY KEY,
     title TEXT NOT NULL,
     image_url TEXT NOT NULL,
     position INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS public.tuning_description_images (
-    id SERIAL PRIMARY KEY,
-    image_url TEXT NOT NULL,
-    caption TEXT,
-    position INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS public.tuning_dynamic_metrics (
-    id SERIAL PRIMARY KEY,
-    description TEXT,
-    image_url TEXT,
-    speed NUMERIC(6,2)
-);
-
-CREATE TABLE IF NOT EXISTS public.tuning_measurement_charts (
-    id SERIAL PRIMARY KEY,
-    description TEXT,
-    image_url TEXT
 );
 
 -- 8.1 Tuning posts/cards
@@ -251,15 +158,6 @@ CREATE TABLE IF NOT EXISTS public.about_page (
     mission_image_url TEXT
 );
 
-CREATE TABLE IF NOT EXISTS public.about_development_milestones (
-    id SERIAL PRIMARY KEY,
-    about_id SMALLINT NOT NULL DEFAULT 1 REFERENCES public.about_page(id) ON DELETE CASCADE,
-    image_url TEXT,
-    description TEXT,
-    year INTEGER,
-    position INTEGER NOT NULL DEFAULT 0
-);
-
 CREATE TABLE IF NOT EXISTS public.about_metrics (
     id SERIAL PRIMARY KEY,
     about_id SMALLINT NOT NULL DEFAULT 1 REFERENCES public.about_page(id) ON DELETE CASCADE,
@@ -299,19 +197,6 @@ CREATE TABLE IF NOT EXISTS public.contact (
     work_schedule TEXT
 );
 
--- 11. Consultation leads
-CREATE TABLE IF NOT EXISTS public.consultation_leads (
-    id BIGSERIAL PRIMARY KEY,
-    name TEXT,
-    phone_number TEXT,
-    email TEXT,
-    marka TEXT,
-    brand TEXT,
-    service_name TEXT,
-    comments TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
 -- 11.1 Mobile app consultations
 CREATE TABLE IF NOT EXISTS public.consultations (
     id BIGSERIAL PRIMARY KEY,
@@ -333,23 +218,6 @@ CREATE TABLE IF NOT EXISTS public.privacy_sections (
     title TEXT NOT NULL,
     description TEXT NOT NULL,
     position INTEGER NOT NULL DEFAULT 0
-);
-
--- 13. Certificates
-CREATE TABLE IF NOT EXISTS public.certificates (
-    id SERIAL PRIMARY KEY,
-    title TEXT NOT NULL,
-    description TEXT,
-    image_url TEXT NOT NULL,
-    position INTEGER NOT NULL DEFAULT 0
-);
-
--- 14. External widget config
-CREATE TABLE IF NOT EXISTS public.widget_configs (
-    id SMALLINT PRIMARY KEY DEFAULT 1,
-    provider TEXT,
-    script_url TEXT,
-    embed_code TEXT
 );
 
 -- 15. Work posts (used by GET /work_post)
@@ -391,28 +259,6 @@ ALTER TABLE IF EXISTS public.work_post
 
 ALTER TABLE IF EXISTS public.blog_posts
     ADD COLUMN IF NOT EXISTS gallery_images JSONB;
-
--- 16. Shop
-CREATE TABLE IF NOT EXISTS public.shop_developers (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE IF NOT EXISTS public.shop_models (
-    id SERIAL PRIMARY KEY,
-    developer_id INTEGER REFERENCES public.shop_developers(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    description TEXT,
-    video_image_url TEXT,
-    video_link TEXT
-);
-
-CREATE TABLE IF NOT EXISTS public.shop_model_images (
-    id SERIAL PRIMARY KEY,
-    model_id INTEGER REFERENCES public.shop_models(id) ON DELETE CASCADE,
-    image_url TEXT NOT NULL,
-    position INTEGER NOT NULL DEFAULT 0
-);
 
 -- Indexes for active API sort patterns.
 CREATE INDEX IF NOT EXISTS idx_banners_priority_id
