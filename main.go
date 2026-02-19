@@ -1448,6 +1448,9 @@ func (a *App) adminCreateOne(w http.ResponseWriter, r *http.Request, cfg tableCR
 	if !ok {
 		return
 	}
+	if cfg.Path == "/admin/tuning" {
+		normalizeTuningCreatePayload(payload)
+	}
 
 	if validationErrors := validateCRUDPayload(payload, cfg.MutableColumns, cfg.RequiredOnCreate); len(validationErrors) > 0 {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
@@ -1456,6 +1459,16 @@ func (a *App) adminCreateOne(w http.ResponseWriter, r *http.Request, cfg tableCR
 			"errors":  validationErrors,
 		})
 		return
+	}
+	if cfg.Path == "/admin/tuning" {
+		if err := a.alignTuningCreatePayloadToSchema(ctx, payload); err != nil {
+			log.Printf("admin create %s schema alignment failed: %v", cfg.Table, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"status":  "error",
+				"message": "failed to prepare payload",
+			})
+			return
+		}
 	}
 
 	keys := sortedMapKeys(payload)
@@ -1736,6 +1749,41 @@ func isEmptyJSONValue(value any) bool {
 		return false
 	}
 	return strings.TrimSpace(text) == ""
+}
+
+func normalizeTuningCreatePayload(payload map[string]any) {
+	title, hasTitle := payload["title"]
+	description, hasDescription := payload["description"]
+
+	if (!hasDescription || isEmptyJSONValue(description)) && hasTitle && !isEmptyJSONValue(title) {
+		payload["description"] = title
+	}
+
+	// Treat `title` as an input alias; final write columns are resolved by schema.
+	delete(payload, "title")
+}
+
+func (a *App) alignTuningCreatePayloadToSchema(ctx context.Context, payload map[string]any) error {
+	hasTitleColumn, err := hasColumn(ctx, a.DB, "tuning", "title")
+	if err != nil {
+		return err
+	}
+	hasDescriptionColumn, err := hasColumn(ctx, a.DB, "tuning", "description")
+	if err != nil {
+		return err
+	}
+
+	description, hasDescription := payload["description"]
+	if hasTitleColumn && hasDescription && !isEmptyJSONValue(description) {
+		payload["title"] = description
+	} else {
+		delete(payload, "title")
+	}
+	if !hasDescriptionColumn {
+		delete(payload, "description")
+	}
+
+	return nil
 }
 
 func sortedMapKeys(values map[string]any) []string {
