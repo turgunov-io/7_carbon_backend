@@ -3,8 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +43,9 @@ const (
 	storageUploadMaxMB  = 25
 	defaultStorageLimit = 50
 	maxStorageLimit     = 500
+	defaultAdminSession = 12 * time.Hour
+	maxAdminSession     = 7 * 24 * time.Hour
+	adminTokenPrefix    = "cgadm1"
 )
 
 func main() {
@@ -76,6 +83,8 @@ func main() {
 	mux.HandleFunc("/api/consultations", app.consultationsHandler)
 	mux.HandleFunc("/portfolio_items", app.portfolioItemsHandler)
 	mux.HandleFunc("/work_post", app.workPostHandler)
+	mux.HandleFunc("/admin/auth/login", app.adminAuthLoginHandler)
+	mux.HandleFunc("/admin/auth/me", app.adminAuthMeHandler)
 	app.registerAdminCRUDRoutes(mux)
 	mux.HandleFunc("/admin/storage/upload", app.adminStorageUploadHandler)
 	mux.HandleFunc("/admin/storage/files", app.adminStorageListHandler)
@@ -1157,7 +1166,133 @@ func (a *App) rootHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/about","/banners","/partners","/tuning","/service_offerings","/privacy_sections","/api/consultations","/portfolio_items","/work_post","/admin/*","/admin/storage/*"]}`))
+	_, _ = w.Write([]byte(`{"service":"carbon_go","status":"running","routes":["/","/healthz","/contact","/about","/banners","/partners","/tuning","/service_offerings","/privacy_sections","/api/consultations","/portfolio_items","/work_post","/admin/auth/*","/admin/*","/admin/storage/*"]}`))
+}
+
+type adminAuthLoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func (a *App) adminAuthLoginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+			"status":  "error",
+			"message": "method not allowed",
+		})
+		return
+	}
+
+	cfg, err := loadAdminAuthConfig()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+	if cfg.Username == "" || cfg.Password == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status":  "error",
+			"message": "admin login is not configured (set ADMIN_USERNAME and ADMIN_PASSWORD)",
+		})
+		return
+	}
+	if cfg.SigningSecret == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status":  "error",
+			"message": "admin login requires JWT_SECRET or ADMIN_JWT_SECRET",
+		})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	defer r.Body.Close()
+
+	var payload adminAuthLoginRequest
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "invalid JSON body",
+		})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status":  "error",
+			"message": "expected a single JSON object",
+		})
+		return
+	}
+
+	username := strings.TrimSpace(payload.Username)
+	password := strings.TrimSpace(payload.Password)
+
+	usernameMatches := subtle.ConstantTimeCompare([]byte(username), []byte(cfg.Username)) == 1
+	passwordMatches := subtle.ConstantTimeCompare([]byte(password), []byte(cfg.Password)) == 1
+	if !usernameMatches || !passwordMatches {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"status":  "error",
+			"message": "invalid credentials",
+		})
+		return
+	}
+
+	token, expiresAt, err := issueAdminAccessToken(username, cfg.SigningSecret, cfg.SessionTTL, time.Now())
+	if err != nil {
+		log.Printf("admin auth token issue failed: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"status":  "error",
+			"message": "failed to issue access token",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"data": map[string]any{
+			"token_type":   "Bearer",
+			"access_token": token,
+			"expires_at":   expiresAt.UTC().Format(time.RFC3339),
+			"expires_in":   int(cfg.SessionTTL.Seconds()),
+			"username":     username,
+		},
+	})
+}
+
+func (a *App) adminAuthMeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+			"status":  "error",
+			"message": "method not allowed",
+		})
+		return
+	}
+	if !requireAdminToken(w, r) {
+		return
+	}
+
+	data := map[string]any{
+		"authenticated": true,
+		"auth_type":     "static_token",
+	}
+
+	cfg, err := loadAdminAuthConfig()
+	if err == nil && cfg.SigningSecret != "" {
+		provided := extractAdminToken(r)
+		claims, verifyErr := verifyAdminAccessToken(provided, cfg.SigningSecret, time.Now())
+		if verifyErr == nil {
+			data["auth_type"] = "bearer"
+			data["username"] = claims.Username
+			data["expires_at"] = time.Unix(claims.Exp, 0).UTC().Format(time.RFC3339)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"data":   data,
+	})
 }
 
 type tableCRUDConfig struct {
@@ -1298,6 +1433,10 @@ func (a *App) registerAdminCRUDRoutes(mux *http.ServeMux) {
 
 func (a *App) makeAdminTableCRUDHandler(cfg tableCRUDConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdminToken(w, r) {
+			return
+		}
+
 		id, hasID, err := parseResourceID(r, cfg.Path)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -2290,29 +2429,184 @@ func (a *App) adminStorageDeleteHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+type adminAuthConfig struct {
+	StaticToken   string
+	Username      string
+	Password      string
+	SigningSecret string
+	SessionTTL    time.Duration
+}
+
+type adminAccessTokenClaims struct {
+	Sub      string `json:"sub"`
+	Username string `json:"username"`
+	Iat      int64  `json:"iat"`
+	Exp      int64  `json:"exp"`
+	Jti      string `json:"jti"`
+}
+
 func requireAdminToken(w http.ResponseWriter, r *http.Request) bool {
-	expected := strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
-	if expected == "" {
-		return true
-	}
-
-	provided := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
-	if provided == "" {
-		auth := strings.TrimSpace(r.Header.Get("Authorization"))
-		if len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
-			provided = strings.TrimSpace(auth[7:])
-		}
-	}
-
-	if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{
+	cfg, err := loadAdminAuthConfig()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"status":  "error",
-			"message": "unauthorized",
+			"message": err.Error(),
 		})
 		return false
 	}
 
-	return true
+	provided := extractAdminToken(r)
+	if provided == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"status":  "error",
+			"message": "missing admin token",
+		})
+		return false
+	}
+
+	if cfg.StaticToken != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.StaticToken)) == 1 {
+		return true
+	}
+
+	if cfg.SigningSecret != "" {
+		if _, err := verifyAdminAccessToken(provided, cfg.SigningSecret, time.Now()); err == nil {
+			return true
+		}
+	}
+
+	writeJSON(w, http.StatusUnauthorized, map[string]any{
+		"status":  "error",
+		"message": "unauthorized",
+	})
+	return false
+}
+
+func extractAdminToken(r *http.Request) string {
+	provided := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
+	if provided != "" {
+		return provided
+	}
+
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+
+	return ""
+}
+
+func loadAdminAuthConfig() (adminAuthConfig, error) {
+	cfg := adminAuthConfig{
+		StaticToken:   strings.TrimSpace(os.Getenv("ADMIN_TOKEN")),
+		Username:      strings.TrimSpace(os.Getenv("ADMIN_USERNAME")),
+		Password:      strings.TrimSpace(os.Getenv("ADMIN_PASSWORD")),
+		SigningSecret: strings.TrimSpace(firstNonEmpty(os.Getenv("ADMIN_JWT_SECRET"), os.Getenv("JWT_SECRET"))),
+		SessionTTL:    resolveAdminSessionTTL(),
+	}
+
+	hasStaticToken := cfg.StaticToken != ""
+	hasCredentials := cfg.Username != "" && cfg.Password != ""
+	if !hasStaticToken && !hasCredentials {
+		return adminAuthConfig{}, errors.New("admin auth is not configured (set ADMIN_TOKEN or ADMIN_USERNAME and ADMIN_PASSWORD)")
+	}
+	if hasCredentials && cfg.SigningSecret == "" && !hasStaticToken {
+		return adminAuthConfig{}, errors.New("JWT_SECRET or ADMIN_JWT_SECRET is required when ADMIN_USERNAME and ADMIN_PASSWORD are set")
+	}
+
+	return cfg, nil
+}
+
+func resolveAdminSessionTTL() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("ADMIN_SESSION_TTL"))
+	if raw == "" {
+		return defaultAdminSession
+	}
+
+	ttl, err := time.ParseDuration(raw)
+	if err != nil || ttl <= 0 {
+		return defaultAdminSession
+	}
+	if ttl > maxAdminSession {
+		return maxAdminSession
+	}
+	return ttl
+}
+
+func issueAdminAccessToken(username, signingSecret string, ttl time.Duration, now time.Time) (string, time.Time, error) {
+	if strings.TrimSpace(signingSecret) == "" {
+		return "", time.Time{}, errors.New("signing secret is required")
+	}
+	if ttl <= 0 {
+		ttl = defaultAdminSession
+	}
+
+	jtiRaw := make([]byte, 16)
+	if _, err := rand.Read(jtiRaw); err != nil {
+		return "", time.Time{}, fmt.Errorf("generate token id: %w", err)
+	}
+
+	expiresAt := now.Add(ttl).UTC()
+	claims := adminAccessTokenClaims{
+		Sub:      "admin",
+		Username: strings.TrimSpace(username),
+		Iat:      now.UTC().Unix(),
+		Exp:      expiresAt.Unix(),
+		Jti:      base64.RawURLEncoding.EncodeToString(jtiRaw),
+	}
+
+	rawClaims, err := json.Marshal(claims)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("marshal token claims: %w", err)
+	}
+
+	payload := base64.RawURLEncoding.EncodeToString(rawClaims)
+	signature := signAdminTokenPayload(payload, signingSecret)
+	token := adminTokenPrefix + "." + payload + "." + base64.RawURLEncoding.EncodeToString(signature)
+
+	return token, expiresAt, nil
+}
+
+func verifyAdminAccessToken(token, signingSecret string, now time.Time) (adminAccessTokenClaims, error) {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 || parts[0] != adminTokenPrefix {
+		return adminAccessTokenClaims{}, errors.New("invalid token format")
+	}
+
+	payload := parts[1]
+	signatureRaw, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return adminAccessTokenClaims{}, errors.New("invalid token signature")
+	}
+
+	expectedSignature := signAdminTokenPayload(payload, signingSecret)
+	if subtle.ConstantTimeCompare(signatureRaw, expectedSignature) != 1 {
+		return adminAccessTokenClaims{}, errors.New("invalid token signature")
+	}
+
+	claimsRaw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return adminAccessTokenClaims{}, errors.New("invalid token payload")
+	}
+
+	var claims adminAccessTokenClaims
+	if err := json.Unmarshal(claimsRaw, &claims); err != nil {
+		return adminAccessTokenClaims{}, errors.New("invalid token claims")
+	}
+
+	if claims.Sub != "admin" {
+		return adminAccessTokenClaims{}, errors.New("invalid token subject")
+	}
+	if claims.Exp <= now.UTC().Unix() {
+		return adminAccessTokenClaims{}, errors.New("token expired")
+	}
+
+	return claims, nil
+}
+
+func signAdminTokenPayload(payload, signingSecret string) []byte {
+	mac := hmac.New(sha256.New, []byte(signingSecret))
+	_, _ = mac.Write([]byte(payload))
+	return mac.Sum(nil)
 }
 
 func loadSupabaseStorageConfig() (supabaseStorageConfig, error) {
@@ -2832,7 +3126,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Token")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

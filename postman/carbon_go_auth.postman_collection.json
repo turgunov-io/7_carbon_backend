@@ -1,0 +1,113 @@
+{
+  "info": {
+    "_postman_id": "e7cd1cce-59fd-4a34-bf4c-39f26f81408f",
+    "name": "carbon_go auth",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Admin Login",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"username\": \"{{admin_username}}\",\n  \"password\": \"{{admin_password}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/admin/auth/login",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "admin",
+            "auth",
+            "login"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "  const json = pm.response.json();",
+              "  pm.environment.set('access_token', json.data.access_token);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin Me",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{access_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/admin/auth/me",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "admin",
+            "auth",
+            "me"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Admin Banners (protected)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{access_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/admin/banners",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "admin",
+            "banners"
+          ]
+        }
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:7777"
+    },
+    {
+      "key": "admin_username",
+      "value": "admincarbon"
+    },
+    {
+      "key": "admin_password",
+      "value": "admin7075"
+    },
+    {
+      "key": "access_token",
+      "value": ""
+    }
+  ]
+}
